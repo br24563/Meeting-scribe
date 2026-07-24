@@ -1,31 +1,37 @@
+import os
 import ollama
 from faster_whisper import WhisperModel
+import config
 
-# Initialize Whisper model locally (loads once in memory)
-@st.cache_resource if 'st' in globals() else lambda x: x
-def load_whisper():
-    return WhisperModel("base", device="cpu", compute_type="int8")
+def check_ollama_status() -> bool:
+    """Verify if local Ollama engine is active and reachable."""
+    try:
+        ollama.list()
+        return True
+    except Exception:
+        return False
 
-def transcribe(audio_bytes) -> str:
-    # Save audio temporarily for Whisper
-    with open("temp_audio.wav", "wb") as f:
+def transcribe_audio(audio_bytes, model_size: str = config.DEFAULT_WHISPER_MODEL) -> str:
+    """Transcribe raw browser audio input using faster-whisper locally."""
+    temp_path = "temp_recording.wav"
+    
+    # Save temporary audio binary from browser
+    with open(temp_path, "wb") as f:
         f.write(audio_bytes.read())
-        
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe("temp_audio.wav")
-    return " ".join([segment.text.strip() for segment in segments])
 
-def generate_summary(transcript: str) -> str:
-    prompt = f"""
-    You are an expert note-taker. Summarize this audio transcript into clean Markdown.
-    
-    Format:
-    ## 🎯 Core Takeaways
-    ## 📌 Key Discussion Points
-    ## 📋 Action Items / Next Steps
-    
-    Transcript:
-    {transcript}
-    """
-    response = ollama.generate(model="llama3.2", prompt=prompt)
-    return response['response']
+    try:
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(temp_path, beam_size=5)
+        full_transcript = " ".join([segment.text.strip() for segment in segments])
+    finally:
+        # Guarantee cleanup of local temporary audio file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    return full_transcript
+
+def generate_summary(transcript: str, model_name: str = config.DEFAULT_OLLAMA_MODEL) -> str:
+    """Generate structured Notion-style Markdown note using local Ollama model."""
+    prompt = config.NOTION_PROMPT.format(transcript=transcript)
+    response = ollama.generate(model=model_name, prompt=prompt)
+    return response["response"]
