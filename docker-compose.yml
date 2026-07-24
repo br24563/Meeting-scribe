@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  echopad:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./notes:/app/notes
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
