@@ -1,5 +1,7 @@
 import os
 import re
+import tempfile
+from functools import lru_cache
 from pathlib import Path
 import ollama
 from faster_whisper import WhisperModel
@@ -15,20 +17,24 @@ def check_ollama_status() -> bool:
     except Exception:
         return False
 
+@lru_cache(maxsize=None)
+def _load_whisper_model(model_size: str) -> WhisperModel:
+    """Load (and cache) a Whisper model so repeated transcriptions don't reload it from disk."""
+    return WhisperModel(model_size, device="cpu", compute_type="int8")
+
 def transcribe_audio(audio_bytes, model_size: str = config.DEFAULT_WHISPER_MODEL, translate: bool = False) -> str:
     """Transcribe or translate audio locally using faster-whisper."""
-    temp_path = "temp_recording.wav"
-    with open(temp_path, "wb") as f:
-        f.write(audio_bytes.read() if hasattr(audio_bytes, "read") else audio_bytes)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(audio_bytes.read() if hasattr(audio_bytes, "read") else audio_bytes)
+        temp_path = tmp.name
 
     try:
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        model = _load_whisper_model(model_size)
         task = "translate" if translate else "transcribe"
         segments, _ = model.transcribe(temp_path, beam_size=5, task=task)
         full_transcript = " ".join([segment.text.strip() for segment in segments])
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        os.remove(temp_path)
 
     return full_transcript
 

@@ -1,3 +1,5 @@
+import os
+import tempfile
 import streamlit as st
 from pathlib import Path
 import config
@@ -10,6 +12,7 @@ if not engine.check_ollama_status():
     st.stop()
 
 st.title("🎙️ EchoPad — AI Voice Notebook")
+st.caption("Study smarter. Interview sharper. Network better. 100% local and private.")
 
 # --- SIDEBAR CONFIG ---
 st.sidebar.header("⚙️ Settings & Pipeline")
@@ -76,10 +79,12 @@ if active_file and active_file.exists():
         html_data = engine.convert_md_to_html(note_content)
         st.download_button("🌐 Download .HTML", data=html_data, file_name=f"{active_file.stem}.html", mime="text/html")
     with col3:
-        pdf_path = f"temp_{active_file.stem}.pdf"
-        engine.convert_md_to_pdf(note_content, pdf_path)
-        with open(pdf_path, "rb") as pf:
-            st.download_button("📄 Download .PDF", data=pf.read(), file_name=f"{active_file.stem}.pdf", mime="application/pdf")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = os.path.join(tmp_dir, f"{active_file.stem}.pdf")
+            engine.convert_md_to_pdf(note_content, pdf_path)
+            with open(pdf_path, "rb") as pf:
+                pdf_bytes = pf.read()
+        st.download_button("📄 Download .PDF", data=pdf_bytes, file_name=f"{active_file.stem}.pdf", mime="application/pdf")
 
     if st.button("❌ Close Note"):
         st.session_state["selected_file"] = None
@@ -87,7 +92,10 @@ if active_file and active_file.exists():
 
 else:
     st.subheader("🆕 Record or Upload Voice Note")
-    title = st.text_input("Note Title", placeholder="e.g. Sprint Planning or Biology Lecture")
+    title = st.text_input(
+        "Note Title",
+        placeholder="e.g. Organic Chemistry Midterm Review, or Interview Debrief — Acme Corp",
+    )
     selected_template = st.selectbox("Select Prompt Template", list(config.TEMPLATES.keys()))
 
     tab_record, tab_upload = st.tabs(["🎙️ Live Mic Record", "📁 Upload Audio File"])
@@ -103,7 +111,13 @@ else:
         if up_data:
             audio_source = up_data
 
+    if not title:
+        st.info("👆 Give your note a title to get started.")
+    elif not audio_source:
+        st.info("🎙️ Record from your mic or upload a file above to continue.")
+
     if audio_source and title:
+        st.caption("First-time use of a Whisper model size downloads it locally — this only happens once.")
         if st.button("✨ Process & Generate Note", type="primary"):
             with st.status("Processing Audio...", expanded=True) as status:
                 st.write("👂 Transcribing audio locally...")
@@ -120,8 +134,13 @@ else:
                 status.update(label="Complete!", state="complete", expanded=False)
 
             full_document = f"# {title}\n*Category: {selected_category}*\n\n{summary}\n\n---\n### 📝 Raw Transcript\n{transcript}"
-            safe_filename = f"{title.lower().strip().replace(' ', '_')}"
-            
+            base_filename = title.lower().strip().replace(' ', '_')
+            safe_filename = base_filename
+            suffix = 1
+            while (cat_dir / f"{safe_filename}.md").exists():
+                suffix += 1
+                safe_filename = f"{base_filename}_{suffix}"
+
             # Save Markdown File
             md_path = cat_dir / f"{safe_filename}.md"
             with open(md_path, "w", encoding="utf-8") as f:
