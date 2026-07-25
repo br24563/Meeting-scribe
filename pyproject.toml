@@ -1,0 +1,21 @@
+[project]
+name = "echopad"
+version = "0.2.0"
+description = "The private, local-first AI voice notebook for students and young professionals."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "streamlit>=1.38",
+    "faster-whisper>=1.0",
+    "ollama>=0.3",
+    "markdown>=3.6",
+    "fpdf2>=2.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

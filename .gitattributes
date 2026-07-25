@@ -1,0 +1,7 @@
+# Keep shell scripts LF-only regardless of platform, so autocrlf on Windows
+# checkouts never corrupts them with embedded \r characters.
+*.command text eol=lf
+*.sh text eol=lf
+
+# Windows batch files should stay CRLF.
+*.bat text eol=crlf

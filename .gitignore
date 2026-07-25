@@ -7,3 +7,5 @@ notes/
 .venv/
 venv/
 .DS_Store
+.env
+*.db

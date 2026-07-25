@@ -24,8 +24,13 @@ Record straight from your browser (or upload a file), and EchoPad transcribes it
 | **Purpose-Built Templates** | Distinct note formats for Lectures, Meetings, Interviews, Brainstorming, and Networking — each tuned to what that context actually needs. |
 | **Live Mic or File Upload** | Record directly from your browser, or upload an existing `.mp3`, `.m4a`, or `.wav`. |
 | **Full-Text Search** | Instantly find any past note by keyword — great for exam review or recalling "who was that contact from the career fair?" |
+| **Tags & Dashboard** | Tag notes (e.g. `midterm`, `chapter-4`), browse by tag, and see a home dashboard with note counts per category and your most recently added notes. |
 | **In-App Editing** | Refine AI-generated notes without leaving the app. |
 | **Multi-Format Export** | Download any note as Markdown, HTML, or PDF for sharing or printing. |
+| **Delete, With a Safety Net** | Every note has a Delete button that opens a confirmation dialog first — no accidental one-click data loss. |
+| **Explorer-Friendly Storage** | Every note gets its own folder (e.g. `notes/Lectures/organic_chemistry_midterm_review/`) holding its `note.md` and `recording.wav` together — browse, back up, or move your notes directly in File Explorer/Finder, no app required. |
+
+Everything is indexed in a local SQLite database (`notes/echopad.db`) so search, tags, and the dashboard stay fast as your note collection grows — while the Markdown and audio files themselves remain plain files on disk, so your notes are never locked into a proprietary format.
 
 ## 🧭 Use Cases
 
@@ -36,7 +41,22 @@ Record straight from your browser (or upload a file), and EchoPad transcribes it
 
 ## 🛠️ Quickstart Guide
 
-### 1. Install System Dependencies (FFmpeg)
+### ✅ Easiest: One-Click Launch (Recommended)
+
+No Python, Ollama, or FFmpeg to install by hand — everything runs in containers.
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (one-time, standard installer).
+2. Download this project and double-click:
+   - **Windows:** [`Launch-EchoPad.bat`](Launch-EchoPad.bat)
+   - **Mac:** [`Launch-EchoPad.command`](Launch-EchoPad.command) (first time, right-click → Open, to get past macOS's unsigned-app warning)
+3. The first launch downloads the AI model in the background (a few minutes); every launch after that is seconds. Your browser opens automatically to EchoPad when it's ready.
+
+To stop EchoPad later, run `docker compose down` from the project folder.
+
+<details>
+<summary><strong>Advanced: Manual setup (no Docker)</strong></summary>
+
+#### 1. Install System Dependencies (FFmpeg)
 
 | OS | Command |
 |---|---|
@@ -44,7 +64,7 @@ Record straight from your browser (or upload a file), and EchoPad transcribes it
 | Ubuntu/Debian | `sudo apt install ffmpeg` |
 | Windows | `winget install ffmpeg` (or download from [ffmpeg.org](https://ffmpeg.org/download.html)) |
 
-### 2. Install Ollama and pull a model
+#### 2. Install Ollama and pull a model
 
 EchoPad summarizes notes with a local LLM served by [Ollama](https://ollama.com/).
 
@@ -54,13 +74,13 @@ ollama pull llama3.2
 
 Make sure Ollama is running (`ollama serve`) before you start EchoPad.
 
-### 3. Install Python Requirements
+#### 3. Install Python Requirements
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Run EchoPad
+#### 4. Run EchoPad
 
 ```bash
 streamlit run app.py
@@ -68,22 +88,36 @@ streamlit run app.py
 
 Open the URL Streamlit prints (typically `http://localhost:8501`) and start recording.
 
-### Optional: Run with Docker
-
-```bash
-docker compose up --build
-```
+</details>
 
 ## 🐳 Configuration
 
 | Setting | Location | Default |
 |---|---|---|
-| Whisper model size | Sidebar dropdown | `base` |
-| Ollama model | Sidebar dropdown | `llama3.2` |
-| Note storage directory | `config.py` → `STORAGE_DIR` | `./notes` |
+| Whisper model size | Sidebar dropdown, or `ECHOPAD_WHISPER_MODEL` in `.env` | `base` |
+| Ollama model | Sidebar dropdown, or `ECHOPAD_OLLAMA_MODEL` in `.env` | `llama3.2` |
+| Note storage directory | `ECHOPAD_STORAGE_DIR` in `.env` | `./notes` |
 | Note categories | `config.py` → `SUBSECTIONS` | Lectures, Meetings, Interviews, Networking, Brainstorming, General |
 
-Notes are saved as plain `.md` files under `./notes/<category>/`, alongside the original audio, so your data stays portable and yours.
+Copy [`.env.example`](.env.example) to `.env` to override any of the above without touching code.
+
+### 📂 Where your notes live
+
+```
+notes/
+├── echopad.db                                   # search index (safe to delete — rebuilds automatically)
+├── Lectures/
+│   └── organic_chemistry_midterm_review/
+│       ├── note.md                              # the generated summary + transcript
+│       └── recording.wav                        # the original audio
+├── Interviews/
+│   └── acme_corp_debrief/
+│       ├── note.md
+│       └── recording.wav
+└── ...
+```
+
+Each note gets its own folder, named after its title, holding everything that belongs to it. Open the `notes/` folder in File Explorer or Finder any time — drag a folder to a USB drive to back it up, rename it, or move it between categories, and EchoPad will pick up the change next time it starts (it re-scans anything not yet in its index). Deleting a note from within the app removes its whole folder; deleting it here is exactly the same as using the app's Delete button.
 
 ## 🧪 Running Tests
 
@@ -93,7 +127,9 @@ pytest
 
 ## 🩹 Troubleshooting
 
-- **"Ollama is not running"** — start it with `ollama serve` in a separate terminal, then refresh the page.
+- **"Docker Desktop was not found"** (one-click launch) — install it from [docker.com](https://www.docker.com/products/docker-desktop/), make sure it's actually running (check for the whale icon), then double-click the launcher again.
+- **First launch seems stuck / browser never opens** — the first run downloads the LLM (~2GB) and Whisper model; this can take a few minutes on a slow connection. Check progress with `docker compose logs -f`.
+- **"Ollama is not running"** (manual setup only) — start it with `ollama serve` in a separate terminal, then refresh the page.
 - **First transcription is slow** — the Whisper model downloads on first use; subsequent runs are much faster.
 - **No audio recorded** — check your browser has granted microphone permission for the EchoPad tab.
 

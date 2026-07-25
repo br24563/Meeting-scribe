@@ -1,14 +1,18 @@
 import os
 from pathlib import Path
 
-STORAGE_DIR = Path("./notes")
+from dotenv import load_dotenv
+
+load_dotenv()
+
+STORAGE_DIR = Path(os.environ.get("ECHOPAD_STORAGE_DIR", "./notes"))
 STORAGE_DIR.mkdir(exist_ok=True)
 
 WHISPER_MODELS = ["tiny", "base", "small"]
-DEFAULT_WHISPER_MODEL = "base"
+DEFAULT_WHISPER_MODEL = os.environ.get("ECHOPAD_WHISPER_MODEL", "base")
 
 OLLAMA_MODELS = ["llama3.2", "qwen2.5", "deepseek-r1:1.5b"]
-DEFAULT_OLLAMA_MODEL = "llama3.2"
+DEFAULT_OLLAMA_MODEL = os.environ.get("ECHOPAD_OLLAMA_MODEL", "llama3.2")
 
 SUBSECTIONS = ["Lectures", "Meetings", "Interviews", "Networking", "Brainstorming", "General"]
 

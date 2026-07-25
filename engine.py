@@ -58,10 +58,21 @@ def search_notes(query: str, storage_dir: Path = config.STORAGE_DIR):
             start = max(0, snippet_idx - 40)
             end = min(len(content), snippet_idx + 80)
             snippet = "..." + content[start:end].replace("\n", " ") + "..."
+
+            # Notes live at <category>/<slug>/note.md; fall back gracefully
+            # for legacy flat files saved as <category>/<slug>.md.
+            rel_parts = filepath.relative_to(storage_dir).parts
+            category = rel_parts[0] if len(rel_parts) > 1 else filepath.parent.name
+            display_name = (
+                filepath.parent.name.replace("_", " ").title()
+                if filepath.name.lower() == "note.md"
+                else filepath.name
+            )
+
             results.append({
                 "path": filepath,
-                "name": filepath.name,
-                "category": filepath.parent.name,
+                "name": display_name,
+                "category": category,
                 "snippet": snippet
             })
     return results
