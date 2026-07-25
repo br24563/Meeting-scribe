@@ -210,5 +210,338 @@ You are an innovation assistant. Format the transcript into structured ideation 
 
 Transcript:
 {transcript}
+""",
+    # ------------------------- Study templates -------------------------
+    "Reading / Chapter": """
+You are a study partner helping a student get the most out of assigned reading. The transcript is the student reading aloud, summarizing, or discussing a text.
+
+> 💡 **What This Reading Is Arguing**
+> (2-3 sentence summary of the central claim or purpose)
+
+---
+### 📚 Source
+* **Text / Chapter:** [Title, chapter, or pages if mentioned]
+* **Author's Position:** [Where this author stands, in one line]
+
+---
+### 🔑 Key Terms & Definitions
+* **[Term]:** Exam-ready definition in the student's own words.
+
+---
+### 🧩 Main Arguments & Evidence
+#### 1. [Argument]
+* The claim, the evidence given for it, and any stated limitation.
+
+---
+### 🤔 Critiques & Open Questions
+* [Where the argument is weak, contested, or unclear — good discussion-section material]
+
+---
+### 🔗 Connections to Course Material
+* [How this links to lectures or other readings mentioned]
+
+---
+### ✅ Self-Check Questions
+* [Question testing comprehension of a main argument]
+
+---
+### 🏷️ Relevant Tags
+#reading #[subject_hashtag] #[topic_hashtag]
+
+Transcript:
+{transcript}
+""",
+    "Lab Report": """
+You are a lab partner turning a spoken account of an experiment into structured lab notes a student can write up later.
+
+> 💡 **Purpose & Outcome**
+> (2-3 sentences: what was tested and what happened)
+
+---
+### 🎯 Hypothesis & Variables
+* **Hypothesis:** [As stated or implied]
+* **Independent / Dependent Variables:** [What was changed, what was measured]
+* **Controls:** [What was held constant]
+
+---
+### 🔬 Procedure as Performed
+1. [Step actually carried out, including any deviation from the protocol]
+
+---
+### 📊 Observations & Data
+* [Measurements, readings, and qualitative observations mentioned]
+
+---
+### 🧠 Analysis & Interpretation
+* [What the data suggests, and whether it supports the hypothesis]
+
+---
+### ⚠️ Sources of Error
+* [Anything noted as imprecise, contaminated, mis-measured, or uncontrolled]
+
+---
+### 📋 Follow-Up Before Write-Up
+- [ ] **[Task]** — Assigned to: [Name/Self] — Due: [Date if mentioned]
+
+---
+### 🏷️ Relevant Tags
+#lab #[course_hashtag] #[experiment_hashtag]
+
+Transcript:
+{transcript}
+""",
+    "Problem Set": """
+You are a tutor turning a student's spoken work through problems into a reviewable worked-solutions document.
+
+> 💡 **Concepts This Set Is Testing**
+> (2-3 sentences naming the underlying skills)
+
+---
+### ✏️ Worked Problems
+#### Problem [N]
+* **Asked:** [What the problem wants]
+* **Approach:** [Method chosen and why]
+* **Steps:** [Key steps, equations, or reasoning in order]
+* **Answer:** [Final result, with units]
+
+---
+### ⚠️ Mistakes & Corrections
+* [Wrong turns taken and what fixed them — the most valuable part to review]
+
+---
+### 🧠 Patterns to Remember
+* [Reusable technique or shortcut worth carrying into the exam]
+
+---
+### ❓ Still Unclear — Ask About These
+- [ ] **[Question to bring to office hours]** — Assigned to: Self — Due: [Date if mentioned]
+
+---
+### 🏷️ Relevant Tags
+#problemset #[course_hashtag] #[topic_hashtag]
+
+Transcript:
+{transcript}
+""",
+    # --------------------- Professional templates ----------------------
+    "One-on-One": """
+You are an executive assistant documenting a 1:1 between an employee and their manager, in a way that is useful to revisit before the next one.
+
+> 💡 **TL;DR**
+> (2-3 sentence summary of the conversation and its tone)
+
+---
+### 🗣️ Topics Discussed
+* **[Topic]:** What was raised and the response.
+
+---
+### 📈 Feedback Received
+* **Strengths noted:** [Specific praise, with the example given]
+* **Areas to develop:** [Specific critique, with the example given]
+
+---
+### 🎯 Goals & Expectations
+* [Any goal, metric, or expectation set or restated, with its timeframe]
+
+---
+### 🚧 Blockers & Support Requested
+* [What the employee said they need, and what was promised]
+
+---
+### 📋 Action Items
+- [ ] **[Task]** — Assigned to: [Name/Role] — Due: [Date if mentioned]
+
+---
+### 💬 Raise Next Time
+* [Anything deferred, or worth following up on in the next 1:1]
+
+---
+### 🏷️ Relevant Tags
+#oneonone #career #[manager_or_team_hashtag]
+
+Transcript:
+{transcript}
+""",
+    "Standup / Weekly Sync": """
+You are a team lead's note-taker capturing a standup or weekly sync so absent teammates can catch up in under a minute.
+
+> 💡 **Status in One Line**
+> (Is the team on track? Anything at risk?)
+
+---
+### ✅ Progress Since Last Sync
+* **[Person/Workstream]:** What shipped or moved.
+
+---
+### 🎯 Plan Until Next Sync
+* **[Person/Workstream]:** What they committed to next.
+
+---
+### 🚧 Blockers & Risks
+* **[Blocker]:** Who is blocked, on what, and who can unblock it.
+
+---
+### 🧭 Decisions Made
+* [Any decision reached, so nobody relitigates it later]
+
+---
+### 📋 Action Items
+- [ ] **[Task]** — Assigned to: [Name/Role] — Due: [Date if mentioned]
+
+---
+### 🏷️ Relevant Tags
+#standup #[team_hashtag] #[project_hashtag]
+
+Transcript:
+{transcript}
+""",
+    "Client / Discovery Call": """
+You are a client-facing note-taker turning a discovery or client call into notes that survive a handoff to a colleague.
+
+> 💡 **Deal / Relationship Summary**
+> (2-3 sentences: who they are, what they need, where this stands)
+
+---
+### 🏢 Client Context
+* **Organization & Contacts:** [Company, names, roles present]
+* **Their Current Setup:** [Tools, process, or vendor they use today]
+
+---
+### 🎯 Needs & Pain Points
+* **[Need]:** In their words where possible, plus why it matters to them.
+
+---
+### 💬 Notable Quotes
+* "[Direct quote worth repeating internally or in a proposal]"
+
+---
+### ⚠️ Objections & Concerns
+* **[Objection]:** What was raised, and how it was answered.
+
+---
+### 💰 Scope, Budget & Timeline Signals
+* [Anything said about size, budget, authority, or deadlines]
+
+---
+### 📋 Action Items
+- [ ] **[Task]** — Assigned to: [Name/Role] — Due: [Date if mentioned]
+
+---
+### 📅 Agreed Next Step
+* [The specific next meeting, deliverable, or decision, and when]
+
+---
+### 🏷️ Relevant Tags
+#client #[company_hashtag] #[stage_hashtag]
+
+Transcript:
+{transcript}
+""",
+    "Performance Review Prep": """
+You are a career coach helping someone assemble evidence for a performance review or promotion case from a spoken brain-dump.
+
+> 💡 **The Case in Three Sentences**
+> (The strongest version of this person's impact this cycle)
+
+---
+### 🏆 Accomplishments With Evidence
+* **[Accomplishment]:** What was done, the measurable outcome, and who benefited. Flag any claim that still needs a number.
+
+---
+### 🤝 Collaboration & Influence
+* [Mentoring, cross-team work, or decisions influenced beyond their own scope]
+
+---
+### 📈 Growth Since Last Review
+* [Skills built, feedback acted on, and how that showed up in the work]
+
+---
+### 🎯 Goals for Next Cycle
+* [Concrete, checkable goals to propose]
+
+---
+### 🚩 Gaps to Address Honestly
+* [Weakness worth naming first, with the plan for it]
+
+---
+### 📋 Prep Action Items
+- [ ] **[Task, e.g. pull metrics for project X]** — Assigned to: Self — Due: [Date if mentioned]
+
+---
+### 🏷️ Relevant Tags
+#performancereview #career #[role_hashtag]
+
+Transcript:
+{transcript}
 """
 }
+
+# Which templates belong to which audience — used only to group the picker.
+STUDY_TEMPLATES = ("Lecture", "Reading / Chapter", "Lab Report", "Problem Set")
+WORK_TEMPLATES = (
+    "Meeting", "One-on-One", "Standup / Weekly Sync", "Client / Discovery Call",
+    "Interview", "Performance Review Prep", "Networking",
+)
+
+# ---------------------------------------------------------------------------
+# Prompts for things derived from notes you've already saved, rather than
+# from a fresh recording.
+# ---------------------------------------------------------------------------
+
+FLASHCARD_PROMPT = """You are creating study flashcards from a student's notes.
+
+Write {count} flashcards covering the most testable facts, definitions, and relationships in the notes below.
+
+Rules:
+- Output NOTHING but the cards, in exactly this format:
+Q: <one specific question>
+A: <a concise answer, 1-2 sentences>
+- One blank line between cards.
+- Each question must stand alone — never say "according to the notes" or "this lecture".
+- Prefer specifics (definitions, mechanisms, dates, formulas, cause-and-effect) over vague prompts.
+- Do not number the cards. Do not add commentary, headings, or a preamble.
+
+Notes:
+{note}
+"""
+
+FOLLOWUP_PROMPT = """You are drafting a follow-up message on behalf of the person whose notes appear below.
+
+Write a {tone} follow-up email that:
+- Opens by referencing something specific and genuine from the conversation (not a generic pleasantry).
+- Confirms any commitments *they* made, and politely restates what the other side agreed to.
+- Asks about any open question left unresolved.
+- Closes with a clear, low-friction next step.
+
+Keep it under 200 words. Output a "Subject:" line, then the body. No placeholders like [Name] unless the notes genuinely don't say — if a name is missing, use a neutral greeting instead.
+
+Notes:
+{note}
+"""
+
+STUDY_GUIDE_PROMPT = """You are building one consolidated exam study guide from several of a student's notes.
+
+Merge them into a single revision document:
+- Open with a short "Big Picture" section tying the material together.
+- Group by theme, NOT by which note something came from.
+- Merge duplicate concepts into one entry; where notes conflict, flag the conflict.
+- Include a "Key Terms" glossary, a "Likely Exam Questions" section, and a "Weak Spots to Review" section listing what the notes cover only thinly.
+- Use Markdown headings. Do not invent material that isn't in the notes.
+
+Notes to merge:
+{note}
+"""
+
+DIGEST_PROMPT = """You are writing a concise status update from someone's own notes for the period below.
+
+Produce:
+- **Highlights** — what actually progressed, phrased as outcomes rather than activity.
+- **Decisions Made** — anything settled, with who settled it.
+- **Open Threads** — what's unresolved and waiting on whom.
+- **Next Period's Focus** — what the notes imply comes next.
+
+Be specific and brief; this is meant to be pasted into a weekly update. Attribute nothing that isn't in the notes.
+
+Notes for this period:
+{note}
+"""

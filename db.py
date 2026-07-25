@@ -14,6 +14,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import config
@@ -39,7 +40,78 @@ CREATE TABLE IF NOT EXISTS preferences (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS flashcards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    interval_days INTEGER NOT NULL DEFAULT 0,
+    ease REAL NOT NULL DEFAULT 2.5,
+    reps INTEGER NOT NULL DEFAULT 0,
+    lapses INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(category, filename, question)
+);
+CREATE INDEX IF NOT EXISTS idx_flashcards_due ON flashcards(due_at);
+
+CREATE TABLE IF NOT EXISTS lms_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL UNIQUE,
+    last_synced TEXT,
+    last_status TEXT DEFAULT '',
+    event_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS deadlines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER,
+    uid TEXT NOT NULL,
+    title TEXT NOT NULL,
+    course TEXT DEFAULT '',
+    due_at TEXT NOT NULL,
+    all_day INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'assignment',
+    url TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    completed INTEGER NOT NULL DEFAULT 0,
+    -- Set when the student edits a deadline that came from a feed. Syncing then
+    -- leaves their version alone instead of overwriting it, while feed_title /
+    -- feed_due_at keep the LMS's own values so "reset to the LMS version" works.
+    user_edited INTEGER NOT NULL DEFAULT 0,
+    feed_title TEXT DEFAULT '',
+    feed_due_at TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(source_id, uid)
+);
+CREATE INDEX IF NOT EXISTS idx_deadlines_due ON deadlines(due_at);
+CREATE INDEX IF NOT EXISTS idx_deadlines_completed ON deadlines(completed);
+
+CREATE TABLE IF NOT EXISTS action_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    text TEXT NOT NULL,
+    owner TEXT DEFAULT '',
+    due TEXT DEFAULT '',
+    done INTEGER NOT NULL DEFAULT 0,
+    raw_line TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(category, filename, raw_line)
+);
+CREATE INDEX IF NOT EXISTS idx_action_items_done ON action_items(done);
 """
+
+# Spaced repetition, SM-2 without the parts that need a full review history.
+MIN_EASE, MAX_EASE = 1.3, 3.0
+# Ten years. Intervals compound, so without a ceiling a well-known card can be
+# pushed past the range `datetime.date` can represent, crashing the review.
+MAX_INTERVAL_DAYS = 3650
 
 # Columns added after the original schema shipped. Applied to existing
 # databases on connect so upgrades don't need a manual migration step.
@@ -148,21 +220,40 @@ def add_note(title: str, category: str, filename: str, template: str = "", tags:
         )
 
 
-def delete_note(category: str, filename: str, db_path=None) -> None:
+def delete_note(category: str, filename: str, cascade: bool = False, db_path=None) -> None:
+    """Remove a note from the index.
+
+    `cascade` also drops its flashcards and action items, and is used when the
+    user deletes a note outright. It stays off for prune_missing(), where a
+    note may only be *temporarily* absent — a cloud folder that hasn't finished
+    syncing shouldn't cost someone their review history.
+    """
     with _connect(db_path) as conn:
         conn.execute(
             "DELETE FROM notes WHERE category = ? AND filename = ?",
             (category, filename),
         )
+        if cascade:
+            conn.execute("DELETE FROM flashcards WHERE category = ? AND filename = ?",
+                         (category, filename))
+            conn.execute("DELETE FROM action_items WHERE category = ? AND filename = ?",
+                         (category, filename))
 
 
 def rename_note(category: str, old_filename: str, new_filename: str, new_title: str,
                 db_path=None) -> None:
+    """Rename a note and re-point everything keyed to it, so a rename never
+    orphans its flashcards or action items."""
     with _connect(db_path) as conn:
         conn.execute(
             "UPDATE notes SET filename = ?, title = ? WHERE category = ? AND filename = ?",
             (new_filename, new_title, category, old_filename),
         )
+        for table in ("flashcards", "action_items"):
+            conn.execute(
+                f"UPDATE OR IGNORE {table} SET filename = ? WHERE category = ? AND filename = ?",
+                (new_filename, category, old_filename),
+            )
 
 
 def update_tags(category: str, filename: str, tags: str, db_path=None) -> None:
@@ -220,6 +311,440 @@ def all_tags(db_path=None):
     for row in rows:
         tags.update(t.strip() for t in row["tags"].split(",") if t.strip())
     return sorted(tags)
+
+
+# ---------------------------------------------------------------------------
+# Flashcards (student study mode)
+# ---------------------------------------------------------------------------
+
+def _today() -> str:
+    return date.today().isoformat()
+
+
+def _add_days(iso_day: str, days: int) -> str:
+    return (date.fromisoformat(iso_day) + timedelta(days=max(0, int(days)))).isoformat()
+
+
+def add_flashcards(category: str, filename: str, cards, today: str = None, db_path=None) -> int:
+    """Store generated cards, skipping questions already saved for this note so
+    regenerating doesn't create duplicates or reset review progress."""
+    today = today or _today()
+    added = 0
+    with _connect(db_path) as conn:
+        for card in cards:
+            question = (card.get("question") or "").strip()
+            answer = (card.get("answer") or "").strip()
+            if not question or not answer:
+                continue
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO flashcards
+                   (category, filename, question, answer, due_at) VALUES (?, ?, ?, ?, ?)""",
+                (category, filename, question, answer, today),
+            )
+            added += cursor.rowcount or 0
+    return added
+
+
+def due_flashcards(today: str = None, limit: int = 50, category: str = None, db_path=None):
+    """Cards ready for review, soonest-due first."""
+    today = today or _today()
+    sql = "SELECT * FROM flashcards WHERE due_at <= ?"
+    params = [today]
+    if category:
+        sql += " AND category = ?"
+        params.append(category)
+    sql += " ORDER BY due_at, id LIMIT ?"
+    params.append(limit)
+    with _connect(db_path) as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def all_flashcards(category: str = None, db_path=None):
+    sql = "SELECT * FROM flashcards"
+    params = []
+    if category:
+        sql += " WHERE category = ?"
+        params.append(category)
+    sql += " ORDER BY category, filename, id"
+    with _connect(db_path) as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def flashcard_stats(today: str = None, db_path=None):
+    today = today or _today()
+    with _connect(db_path) as conn:
+        total = conn.execute("SELECT COUNT(*) AS n FROM flashcards").fetchone()["n"]
+        due = conn.execute(
+            "SELECT COUNT(*) AS n FROM flashcards WHERE due_at <= ?", (today,)
+        ).fetchone()["n"]
+        reviewed = conn.execute(
+            "SELECT COUNT(*) AS n FROM flashcards WHERE reps > 0"
+        ).fetchone()["n"]
+    return {"total": total, "due": due, "reviewed": reviewed}
+
+
+def review_flashcard(card_id: int, grade: str, today: str = None, db_path=None):
+    """Record a review and reschedule the card.
+
+    `grade` is "again", "good", or "easy". Intervals grow by the card's ease
+    factor; "again" resets it to same-day and nudges the ease down, so cards
+    you keep missing keep coming back.
+    """
+    today = today or _today()
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM flashcards WHERE id = ?", (card_id,)).fetchone()
+        if row is None:
+            return None
+        ease, interval = row["ease"], row["interval_days"]
+        reps, lapses = row["reps"] + 1, row["lapses"]
+
+        if grade == "again":
+            ease = max(MIN_EASE, ease - 0.20)
+            interval = 0
+            lapses += 1
+        elif grade == "easy":
+            ease = min(MAX_EASE, ease + 0.15)
+            interval = min(MAX_INTERVAL_DAYS, max(4, round(max(interval, 1) * ease * 1.3)))
+        else:  # "good"
+            interval = 1 if interval < 1 else min(MAX_INTERVAL_DAYS, max(1, round(interval * ease)))
+
+        due_at = _add_days(today, interval)
+        conn.execute(
+            """UPDATE flashcards SET ease = ?, interval_days = ?, reps = ?, lapses = ?, due_at = ?
+               WHERE id = ?""",
+            (ease, interval, reps, lapses, due_at, card_id),
+        )
+    return {"id": card_id, "ease": ease, "interval_days": interval, "reps": reps,
+            "lapses": lapses, "due_at": due_at}
+
+
+def delete_flashcards_for_note(category: str, filename: str, db_path=None) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM flashcards WHERE category = ? AND filename = ?",
+                     (category, filename))
+
+
+# ---------------------------------------------------------------------------
+# Action items (professional task tracking)
+# ---------------------------------------------------------------------------
+
+def replace_action_items(category: str, filename: str, items, db_path=None) -> int:
+    """Re-sync a note's action items with what its Markdown currently says.
+
+    The note file is the source of truth for both the wording and the tick
+    state, so a rescan replaces the rows outright rather than trying to merge —
+    which keeps the app and the file from drifting apart.
+    """
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM action_items WHERE category = ? AND filename = ?",
+                     (category, filename))
+        stored = 0
+        for item in items:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO action_items
+                   (category, filename, text, owner, due, done, raw_line)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (category, filename, item["text"], item.get("owner", ""),
+                 item.get("due", ""), 1 if item.get("done") else 0, item["raw_line"]),
+            )
+            stored += cursor.rowcount or 0
+    return stored
+
+
+def action_items(category: str = None, include_done: bool = False, db_path=None):
+    sql = "SELECT * FROM action_items WHERE 1=1"
+    params = []
+    if not include_done:
+        sql += " AND done = 0"
+    if category:
+        sql += " AND category = ?"
+        params.append(category)
+    # Items with a stated due date first, then by note
+    sql += " ORDER BY done, (due = '') , due, category, filename, id"
+    with _connect(db_path) as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def get_action_item(item_id: int, db_path=None):
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM action_items WHERE id = ?", (item_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_action_done(item_id: int, done: bool, new_raw_line: str = None, db_path=None) -> None:
+    """Mark an item complete. `new_raw_line` keeps the stored line in step with
+    the rewritten Markdown, so a later rescan matches it."""
+    with _connect(db_path) as conn:
+        if new_raw_line is None:
+            conn.execute("UPDATE action_items SET done = ? WHERE id = ?",
+                         (1 if done else 0, item_id))
+        else:
+            conn.execute("UPDATE action_items SET done = ?, raw_line = ? WHERE id = ?",
+                         (1 if done else 0, new_raw_line, item_id))
+
+
+def action_item_stats(db_path=None):
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total, COALESCE(SUM(done), 0) AS done FROM action_items"
+        ).fetchone()
+    total, done = row["total"], int(row["done"] or 0)
+    return {"total": total, "done": done, "open": total - done}
+
+
+def delete_action_items_for_note(category: str, filename: str, db_path=None) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM action_items WHERE category = ? AND filename = ?",
+                     (category, filename))
+
+
+# ---------------------------------------------------------------------------
+# LMS calendar feeds and the deadlines they contain
+# ---------------------------------------------------------------------------
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def add_lms_source(name: str, provider: str, url: str, db_path=None) -> int:
+    """Register a calendar feed, or return the existing row if the URL is
+    already connected (so pasting the same link twice doesn't duplicate it)."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO lms_sources (name, provider, url) VALUES (?, ?, ?)
+               ON CONFLICT(url) DO UPDATE SET name = excluded.name,
+                                              provider = excluded.provider""",
+            (name, provider, url),
+        )
+        row = conn.execute("SELECT id FROM lms_sources WHERE url = ?", (url,)).fetchone()
+    return row["id"]
+
+
+def lms_sources(db_path=None):
+    with _connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM lms_sources ORDER BY name, id").fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_lms_source(source_id: int, db_path=None):
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM lms_sources WHERE id = ?", (source_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_lms_source_status(source_id: int, status: str, event_count: int = None,
+                             synced_at: str = None, db_path=None) -> None:
+    with _connect(db_path) as conn:
+        if event_count is None:
+            conn.execute("UPDATE lms_sources SET last_status = ?, last_synced = ? WHERE id = ?",
+                         (status, synced_at or _utc_now_iso(), source_id))
+        else:
+            conn.execute(
+                """UPDATE lms_sources SET last_status = ?, last_synced = ?, event_count = ?
+                   WHERE id = ?""",
+                (status, synced_at or _utc_now_iso(), event_count, source_id),
+            )
+
+
+def delete_lms_source(source_id: int, db_path=None) -> None:
+    """Disconnect a feed and drop the deadlines that came from it. Manually
+    added deadlines have no source and are untouched."""
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM deadlines WHERE source_id = ?", (source_id,))
+        conn.execute("DELETE FROM lms_sources WHERE id = ?", (source_id,))
+
+
+def upsert_deadlines(source_id: int, items, db_path=None):
+    """Sync a feed's deadlines into the index.
+
+    Existing rows are updated in place — a professor moving a due date should be
+    reflected — with two deliberate exceptions:
+
+    * the student's `completed` tick is never cleared, so re-syncing can't
+      un-finish their work; and
+    * a row they've edited themselves keeps their version. The feed's own values
+      are still recorded in feed_title/feed_due_at so the edit can be reverted.
+
+    Returns (added, updated, skipped_edited).
+    """
+    added = updated = skipped = 0
+    with _connect(db_path) as conn:
+        for item in items:
+            existing = conn.execute(
+                "SELECT id, user_edited FROM deadlines WHERE source_id IS ? AND uid = ?",
+                (source_id, item["uid"]),
+            ).fetchone()
+            if existing and existing["user_edited"]:
+                # Track what the feed says now, but leave the student's edit intact.
+                conn.execute(
+                    "UPDATE deadlines SET feed_title = ?, feed_due_at = ? WHERE id = ?",
+                    (item["title"], item["due_at"], existing["id"]),
+                )
+                skipped += 1
+            elif existing:
+                conn.execute(
+                    """UPDATE deadlines SET title = ?, course = ?, due_at = ?, all_day = ?,
+                              kind = ?, url = ?, description = ?,
+                              feed_title = ?, feed_due_at = ? WHERE id = ?""",
+                    (item["title"], item.get("course", ""), item["due_at"],
+                     1 if item.get("all_day") else 0, item.get("kind", "assignment"),
+                     item.get("url", ""), item.get("description", ""),
+                     item["title"], item["due_at"], existing["id"]),
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    """INSERT INTO deadlines
+                       (source_id, uid, title, course, due_at, all_day, kind, url,
+                        description, feed_title, feed_due_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (source_id, item["uid"], item["title"], item.get("course", ""),
+                     item["due_at"], 1 if item.get("all_day") else 0,
+                     item.get("kind", "assignment"), item.get("url", ""),
+                     item.get("description", ""), item["title"], item["due_at"]),
+                )
+                added += 1
+    return added, updated, skipped
+
+
+def update_deadline(deadline_id: int, title: str = None, course: str = None,
+                    due_at: str = None, all_day: bool = None, kind: str = None,
+                    url: str = None, description: str = None,
+                    mark_edited: bool = True, db_path=None) -> None:
+    """Edit a deadline. Any field left as None is untouched.
+
+    Editing a feed-sourced deadline marks it as user-edited so the next sync
+    respects the change rather than overwriting it.
+    """
+    fields, values = [], []
+    for column, value in (("title", title), ("course", course), ("due_at", due_at),
+                          ("kind", kind), ("url", url), ("description", description)):
+        if value is not None:
+            fields.append(f"{column} = ?")
+            values.append(value)
+    if all_day is not None:
+        fields.append("all_day = ?")
+        values.append(1 if all_day else 0)
+    if not fields:
+        return
+    if mark_edited:
+        fields.append("user_edited = 1")
+    values.append(deadline_id)
+    with _connect(db_path) as conn:
+        conn.execute(f"UPDATE deadlines SET {', '.join(fields)} WHERE id = ?", values)
+
+
+def revert_deadline_to_feed(deadline_id: int, db_path=None) -> bool:
+    """Discard a local edit and go back to what the LMS feed says.
+
+    Returns False when there's nothing to revert to (a manually added deadline,
+    or one whose feed values were never recorded).
+    """
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT feed_title, feed_due_at FROM deadlines WHERE id = ?", (deadline_id,)
+        ).fetchone()
+        if row is None or not row["feed_title"] or not row["feed_due_at"]:
+            return False
+        conn.execute(
+            """UPDATE deadlines SET title = ?, due_at = ?, user_edited = 0 WHERE id = ?""",
+            (row["feed_title"], row["feed_due_at"], deadline_id),
+        )
+    return True
+
+
+def prune_deadlines_missing_from_feed(source_id: int, seen_uids, db_path=None) -> int:
+    """Drop rows for a feed's entries that no longer appear in it — an assignment
+    the professor deleted.
+
+    Skipped entirely when the feed returned nothing, so a partial fetch can't
+    wipe a term's deadlines, and rows the student has edited are always kept:
+    their own work outranks the feed's idea of what exists.
+    """
+    seen = list(seen_uids)
+    if not seen:
+        return 0
+    with _connect(db_path) as conn:
+        placeholders = ",".join("?" * len(seen))
+        cursor = conn.execute(
+            f"""DELETE FROM deadlines
+                WHERE source_id IS ? AND user_edited = 0 AND uid NOT IN ({placeholders})""",
+            [source_id, *seen],
+        )
+    return cursor.rowcount or 0
+
+
+def add_manual_deadline(title: str, due_at: str, course: str = "", all_day: bool = False,
+                        kind: str = "assignment", url: str = "", description: str = "",
+                        db_path=None) -> int:
+    """Add a deadline by hand — for a Gradescope-only assignment, or anything
+    that isn't in a feed. Stored with no source so syncing never disturbs it."""
+    uid = f"manual-{abs(hash((title, due_at, course)))}-{_utc_now_iso()}"
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            """INSERT INTO deadlines
+               (source_id, uid, title, course, due_at, all_day, kind, url, description)
+               VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (uid, title, course, due_at, 1 if all_day else 0, kind, url, description),
+        )
+        return cursor.lastrowid
+
+
+def deadlines(include_completed: bool = False, since: str = None, until: str = None,
+              db_path=None):
+    sql = "SELECT * FROM deadlines WHERE 1=1"
+    params = []
+    if not include_completed:
+        sql += " AND completed = 0"
+    if since:
+        sql += " AND due_at >= ?"
+        params.append(since)
+    if until:
+        sql += " AND due_at <= ?"
+        params.append(until)
+    sql += " ORDER BY due_at, title"
+    with _connect(db_path) as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def overdue_deadlines(now: str = None, db_path=None):
+    """Open deadlines whose date has passed."""
+    now = now or _utc_now_iso()
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM deadlines WHERE completed = 0 AND due_at < ? ORDER BY due_at",
+            (now,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_deadline_completed(deadline_id: int, completed: bool, db_path=None) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("UPDATE deadlines SET completed = ? WHERE id = ?",
+                     (1 if completed else 0, deadline_id))
+
+
+def delete_deadline(deadline_id: int, db_path=None) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM deadlines WHERE id = ?", (deadline_id,))
+
+
+def deadline_stats(now: str = None, horizon_days: int = 7, db_path=None):
+    now = now or _utc_now_iso()
+    horizon = (datetime.fromisoformat(now) + timedelta(days=horizon_days)) \
+        .replace(microsecond=0).isoformat()
+    with _connect(db_path) as conn:
+        overdue = conn.execute(
+            "SELECT COUNT(*) AS n FROM deadlines WHERE completed = 0 AND due_at < ?", (now,)
+        ).fetchone()["n"]
+        soon = conn.execute(
+            """SELECT COUNT(*) AS n FROM deadlines
+               WHERE completed = 0 AND due_at >= ? AND due_at <= ?""", (now, horizon)
+        ).fetchone()["n"]
+        total_open = conn.execute(
+            "SELECT COUNT(*) AS n FROM deadlines WHERE completed = 0"
+        ).fetchone()["n"]
+    return {"overdue": overdue, "due_soon": soon, "open": total_open}
 
 
 def get_pref(key: str, default: str = None, db_path=None) -> str:

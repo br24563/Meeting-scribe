@@ -60,6 +60,164 @@ def generate_summary(transcript: str, template: str, model_name: str = config.DE
     response = ollama.generate(model=model_name, prompt=prompt)
     return response["response"]
 
+# ---------------------------------------------------------------------------
+# Action items
+#
+# The note templates already emit tasks as Markdown checkboxes, e.g.
+#   - [ ] **Send the deck** — Assigned to: Priya — Due: Friday
+# so these are parsed straight out of the note text. No model call, no waiting,
+# and the note file stays the single source of truth for what's outstanding.
+# ---------------------------------------------------------------------------
+
+_CHECKBOX_RE = re.compile(r"^(\s*)([-*+])\s+\[([ xX])\]\s*(.+?)\s*$")
+_PLACEHOLDER_RE = re.compile(r"^\[.*\]$")
+
+# Fields are separated by a dash/pipe/bullet *surrounded by whitespace*. Requiring
+# the whitespace matters: a bare hyphen also appears inside values we must not
+# split on, such as the date in "Due: 2026-08-01".
+_SEGMENT_SPLIT_RE = re.compile(r"\s+[-–—|·]{1,2}(?:\s+|$)")
+# Metadata run with no separator at all, e.g. "Ship the deck Due: Friday".
+_INLINE_META_RE = re.compile(r"\s+(?=(?:assigned\s*to|owner|due)\s*:)", re.IGNORECASE)
+_OWNER_FIELD_RE = re.compile(r"^(?:assigned\s*to|owner)\s*:\s*(.*)$", re.IGNORECASE)
+_DUE_FIELD_RE = re.compile(r"^due\s*(?:date)?\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def _clean_field(value: str) -> str:
+    """Trim a parsed value, dropping unfilled template placeholders."""
+    value = (value or "").strip().strip("*_` ").strip()
+    if not value or _PLACEHOLDER_RE.match(value):
+        return ""
+    return value
+
+
+def _classify_segments(segments):
+    """Sort segments into task text vs. owner/due metadata."""
+    text_parts, owner, due = [], "", ""
+    for segment in segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        owner_match = _OWNER_FIELD_RE.match(segment)
+        due_match = _DUE_FIELD_RE.match(segment)
+        if owner_match:
+            owner = owner or _clean_field(owner_match.group(1))
+        elif due_match:
+            due = due or _clean_field(due_match.group(1))
+        else:
+            text_parts.append(segment)
+    return " ".join(text_parts).strip(), owner, due
+
+
+def parse_action_items(md_text: str):
+    """Extract Markdown checkbox tasks from a note.
+
+    Handles the separators models actually emit — em dash, en dash, plain
+    hyphen, pipe — and tolerates the metadata being absent or left as an
+    unfilled template placeholder.
+
+    Returns dicts with `text` (the task without its owner/due metadata),
+    `owner`, `due`, `done`, and `raw_line` — the untouched source line, which
+    is what set_checkbox() matches on to write a completion back to the file.
+    """
+    items = []
+    for line in (md_text or "").split("\n"):
+        match = _CHECKBOX_RE.match(line)
+        if not match:
+            continue
+
+        text, owner, due = _classify_segments(_SEGMENT_SPLIT_RE.split(match.group(4)))
+        if not owner or not due:
+            # Metadata may follow the task without a separator between them
+            retry_text, retry_owner, retry_due = _classify_segments(_INLINE_META_RE.split(text))
+            text = retry_text or text
+            owner = owner or retry_owner
+            due = due or retry_due
+
+        text = _clean_field(text)
+        if not text:
+            continue  # an untouched template placeholder, not a real task
+
+        items.append({
+            "text": text,
+            "owner": owner,
+            "due": due,
+            "done": match.group(3) in ("x", "X"),
+            "raw_line": line,
+        })
+    return items
+
+
+def set_checkbox(md_text: str, raw_line: str, done: bool):
+    """Tick or untick one checkbox in a note, matching `raw_line` exactly.
+
+    Returns (new_text, changed) so callers can skip rewriting the file when
+    the note has drifted and the line no longer matches.
+    """
+    lines = (md_text or "").split("\n")
+    for index, line in enumerate(lines):
+        if line != raw_line:
+            continue
+        match = _CHECKBOX_RE.match(line)
+        if not match:
+            break
+        indent, bullet, _, body = match.groups()
+        lines[index] = f"{indent}{bullet} [{'x' if done else ' '}] {body}"
+        return "\n".join(lines), True
+    return md_text, False
+
+
+# ---------------------------------------------------------------------------
+# Things derived from notes you've already saved
+# ---------------------------------------------------------------------------
+
+_FLASHCARD_RE = re.compile(
+    r"^\s*(?:\d+[.)]\s*)?Q\s*[:.]\s*(?P<q>.+?)\s*$\n+^\s*A\s*[:.]\s*(?P<a>.+?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def parse_flashcards(raw: str):
+    """Pull Q/A pairs out of a model response.
+
+    Models tend to add a preamble, number the cards, or wrap them in Markdown
+    even when told not to, so this tolerates all three rather than failing.
+    """
+    cards = []
+    for match in _FLASHCARD_RE.finditer(raw or ""):
+        question = match.group("q").strip().strip("*_` ").strip()
+        answer = match.group("a").strip().strip("*_` ").strip()
+        if question and answer:
+            cards.append({"question": question, "answer": answer})
+    return cards
+
+
+def generate_flashcards(note_text: str, count: int = 10,
+                        model_name: str = config.DEFAULT_OLLAMA_MODEL):
+    """Generate study flashcards from a saved note."""
+    prompt = config.FLASHCARD_PROMPT.format(count=count, note=note_text)
+    response = ollama.generate(model=model_name, prompt=prompt)
+    return parse_flashcards(response["response"])
+
+
+def generate_followup(note_text: str, tone: str = "warm but professional",
+                      model_name: str = config.DEFAULT_OLLAMA_MODEL) -> str:
+    """Draft a follow-up email from a meeting, interview, or networking note."""
+    prompt = config.FOLLOWUP_PROMPT.format(tone=tone, note=note_text)
+    return ollama.generate(model=model_name, prompt=prompt)["response"]
+
+
+def synthesize_notes(sections, prompt_template: str,
+                     model_name: str = config.DEFAULT_OLLAMA_MODEL) -> str:
+    """Merge several notes into one document (study guide, weekly digest, …).
+
+    `sections` is an iterable of (title, text) pairs; each is labelled so the
+    model can attribute material, and so conflicts between notes are visible.
+    """
+    combined = "\n\n".join(f"--- NOTE: {title} ---\n{text}" for title, text in sections)
+    prompt = prompt_template.format(note=combined)
+    return ollama.generate(model=model_name, prompt=prompt)["response"]
+
+
 def search_notes(query: str, storage_dir: Path = config.STORAGE_DIR):
     """Perform full-text search across all saved Markdown files."""
     results = []

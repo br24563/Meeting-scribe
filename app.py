@@ -1,16 +1,22 @@
+import csv
 import io
 import os
 import shutil
 import tempfile
 import zipfile
+from datetime import date, datetime, time, timedelta, timezone
 import streamlit as st
 from pathlib import Path
 import config
 import db
 import engine
+import importers
+import lms
 import storage
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.5.0"
+# Auto-refresh a connected feed if it hasn't been checked in this long.
+FEED_STALE_HOURS = 6
 NOTE_FILENAME = "note.md"
 AUDIO_FILENAME = "recording.wav"
 
@@ -64,6 +70,193 @@ def _build_backup_zip() -> bytes:
     return buf.getvalue()
 
 
+def _note_path(category: str, filename: str) -> Path:
+    return config.STORAGE_DIR / category / filename
+
+
+def _read_note(category: str, filename: str) -> str:
+    try:
+        return _note_path(category, filename).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _sync_action_items(md_path: Path, note_text: str) -> int:
+    """Re-read a note's checkbox tasks into the index. Cheap and deterministic —
+    the templates already emit tasks as Markdown checkboxes, so no model call."""
+    category, filename = db.relative_key(md_path)
+    items = engine.parse_action_items(note_text)
+    db.replace_action_items(category, filename, items)
+    return len(items)
+
+
+def _resync_all_action_items() -> int:
+    """Re-derive every note's action items from its file.
+
+    Runs once per session so tasks are always what the notes actually say —
+    including notes synced down from another computer or edited outside the app,
+    which otherwise wouldn't show up until someone hit Rescan by hand. Parsing
+    is a regex over text already on disk, so this stays cheap.
+    """
+    notes_seen = 0
+    for note in db.search(""):
+        body = _read_note(note["category"], note["filename"])
+        if body:
+            db.replace_action_items(
+                note["category"], note["filename"], engine.parse_action_items(body))
+            notes_seen += 1
+    return notes_seen
+
+
+def _complete_action_item(item: dict, done: bool) -> bool:
+    """Tick an item off in the note file itself, then in the index.
+
+    The Markdown is the source of truth for what's outstanding, so if the line
+    can no longer be found (the note was edited by hand) we leave the file alone
+    and say so rather than silently diverging.
+    """
+    md_path = _note_path(item["category"], item["filename"])
+    text = _read_note(item["category"], item["filename"])
+    updated, changed = engine.set_checkbox(text, item["raw_line"], done)
+    if not changed:
+        return False
+    try:
+        md_path.write_text(updated, encoding="utf-8")
+    except OSError:
+        return False
+    new_line, _ = engine.set_checkbox(item["raw_line"], item["raw_line"], done)
+    db.set_action_done(item["id"], done, new_raw_line=new_line)
+    return True
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _to_local(iso_utc: str) -> datetime:
+    """Parse a stored UTC timestamp into the machine's local timezone."""
+    return datetime.fromisoformat(iso_utc).astimezone()
+
+
+def _due_label(deadline: dict, now: datetime = None) -> str:
+    """Human phrasing for when something is due, relative to now."""
+    now = now or datetime.now().astimezone()
+    due = _to_local(deadline["due_at"])
+    when = due.strftime("%a %d %b") if deadline["all_day"] else due.strftime("%a %d %b, %H:%M")
+
+    days = (due.date() - now.date()).days
+    if due < now:
+        overdue_days = (now.date() - due.date()).days
+        if overdue_days == 0:
+            return f"{when} · ⚠️ overdue"
+        return f"{when} · ⚠️ {overdue_days} day{'s' if overdue_days != 1 else ''} overdue"
+    if days == 0:
+        return f"{when} · today"
+    if days == 1:
+        return f"{when} · tomorrow"
+    if days <= 7:
+        return f"{when} · in {days} days"
+    return when
+
+
+def _sync_feed(source: dict) -> tuple:
+    """Fetch and store one feed. Returns (ok, message)."""
+    try:
+        items, warnings = lms.fetch_and_parse(source["url"])
+    except lms.FeedError as exc:
+        db.update_lms_source_status(source["id"], f"error: {exc}")
+        return False, str(exc)
+
+    added, updated, skipped = db.upsert_deadlines(source["id"], items)
+    removed = db.prune_deadlines_missing_from_feed(
+        source["id"], [item["uid"] for item in items])
+    db.update_lms_source_status(source["id"], "ok", event_count=len(items))
+
+    parts = [f"{added} new"] if added else []
+    if updated:
+        parts.append(f"{updated} updated")
+    if removed:
+        parts.append(f"{removed} removed")
+    if skipped:
+        parts.append(f"{skipped} kept as you edited them")
+    summary = ", ".join(parts) if parts else "no changes"
+    return True, "; ".join([f"{source['name']}: {summary}", *warnings])
+
+
+def _feed_is_stale(source: dict) -> bool:
+    if not source.get("last_synced"):
+        return True
+    try:
+        last = datetime.fromisoformat(source["last_synced"])
+    except (TypeError, ValueError):
+        return True
+    return datetime.now(timezone.utc) - last > timedelta(hours=FEED_STALE_HOURS)
+
+
+@st.dialog("Edit deadline")
+def _edit_deadline_dialog(deadline: dict):
+    """Edit any deadline — including one that came from an LMS feed.
+
+    Editing a feed deadline marks it as yours, so syncing won't overwrite it;
+    the LMS's own version is kept so the edit can be undone.
+    """
+    from_feed = deadline["source_id"] is not None
+    if from_feed and deadline["user_edited"]:
+        st.caption(
+            f"Edited by you. Your LMS currently says: **{deadline['feed_title']}** due "
+            f"{_to_local(deadline['feed_due_at']).strftime('%a %d %b, %H:%M')}."
+        )
+    elif from_feed:
+        st.caption("This came from a connected feed. Your edits will survive future syncs.")
+
+    title = st.text_input("Title", value=deadline["title"], key="ed_title")
+    course = st.text_input("Course", value=deadline["course"] or "", key="ed_course")
+
+    current = _to_local(deadline["due_at"])
+    col_date, col_time = st.columns(2)
+    with col_date:
+        new_date = st.date_input("Due date", value=current.date(), key="ed_date")
+    with col_time:
+        all_day = st.checkbox("All day", value=bool(deadline["all_day"]), key="ed_allday")
+        new_time = st.time_input("Due time", value=current.time().replace(second=0),
+                                 key="ed_time", disabled=all_day)
+
+    kind = st.selectbox("Type", ["assignment", "event"],
+                        index=0 if deadline["kind"] == "assignment" else 1, key="ed_kind")
+    notes = st.text_area("Notes", value=deadline["description"] or "", height=100, key="ed_desc")
+
+    st.divider()
+    col_cancel, col_save = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    with col_save:
+        if st.button("💾 Save", type="primary", use_container_width=True):
+            if not title.strip():
+                st.error("Give the deadline a title.")
+                return
+            chosen = time(23, 59) if all_day else new_time
+            local_due = datetime.combine(new_date, chosen).astimezone()
+            db.update_deadline(
+                deadline["id"], title=title.strip(), course=course.strip(),
+                due_at=local_due.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                all_day=all_day, kind=kind, description=notes.strip(),
+            )
+            st.session_state["flash"] = f'Updated "{title.strip()}".'
+            st.rerun()
+
+    if from_feed and deadline["user_edited"] and deadline["feed_title"]:
+        if st.button("↩️ Reset to the LMS version", use_container_width=True):
+            db.revert_deadline_to_feed(deadline["id"])
+            st.session_state["flash"] = "Reset to what your LMS says."
+            st.rerun()
+
+    if st.button("🗑️ Delete this deadline", use_container_width=True):
+        db.delete_deadline(deadline["id"])
+        st.session_state["flash"] = f'Deleted "{deadline["title"]}".'
+        st.rerun()
+
+
 def _delete_note(md_path: Path) -> None:
     """Permanently remove a note's markdown, audio, and index entry."""
     category, filename = db.relative_key(md_path)
@@ -75,7 +268,8 @@ def _delete_note(md_path: Path) -> None:
         md_path.unlink(missing_ok=True)
         _audio_path(md_path).unlink(missing_ok=True)
         storage.meta_path(md_path, NOTE_FILENAME).unlink(missing_ok=True)
-    db.delete_note(category, filename)
+    # cascade: an intentional delete should take the note's cards and tasks with it
+    db.delete_note(category, filename, cascade=True)
 
 
 @st.dialog("Delete this note?")
@@ -156,6 +350,7 @@ if "index_synced" not in st.session_state:
     db.migrate_legacy_index()
     db.prune_missing()
     db.rebuild_from_disk()
+    _resync_all_action_items()
     st.session_state["index_synced"] = True
 
 if db.get_pref("compact_mode", default="false") == "true":
@@ -301,8 +496,98 @@ if active_file and active_file.exists():
                 f.write(edited_content)
             db.update_word_count(note_category, note_filename, len(edited_content.split()))
             storage.write_note_meta(active_file, NOTE_FILENAME, word_count=len(edited_content.split()))
+            # Editing may have added, reworded, or ticked off tasks
+            _sync_action_items(active_file, edited_content)
             st.session_state["flash"] = "Note updated successfully."
             st.rerun()
+
+    # This note's action items, tickable in place
+    note_tasks = db.action_items(include_done=True)
+    note_tasks = [t for t in note_tasks
+                  if t["category"] == note_category and t["filename"] == note_filename]
+    if note_tasks:
+        open_count = sum(1 for t in note_tasks if not t["done"])
+        with st.expander(f"✅ Action Items ({open_count} open of {len(note_tasks)})", expanded=bool(open_count)):
+            for task in note_tasks:
+                ticked = st.checkbox(task["text"], value=bool(task["done"]), key=f"note_task_{task['id']}")
+                bits = [b for b in (f"👤 {task['owner']}" if task["owner"] else "",
+                                    f"📅 {task['due']}" if task["due"] else "") if b]
+                if bits:
+                    st.caption(" · ".join(bits))
+                if ticked != bool(task["done"]):
+                    ok = _complete_action_item(task, ticked)
+                    st.session_state["flash"] = (
+                        ("Marked done." if ticked else "Reopened.") if ok
+                        else "That line has changed in the note — rescan from the Work tab."
+                    )
+                    st.rerun()
+
+    # Attach supplementary material — a handout, a photo of the board, a slide deck
+    with st.expander("📎 Attachments", expanded=False):
+        existing = sorted(
+            p for p in active_file.parent.iterdir()
+            if p.is_file() and p.name not in (NOTE_FILENAME, AUDIO_FILENAME, storage.META_FILENAME)
+        ) if active_file.name == NOTE_FILENAME else []
+        if existing:
+            for attachment in existing:
+                acol, dcol = st.columns([4, 1])
+                acol.write(f"📄 {attachment.name}  ·  {attachment.stat().st_size / 1024:,.0f} KB")
+                with dcol:
+                    st.download_button("Download", data=attachment.read_bytes(),
+                                       file_name=attachment.name, key=f"dl_{attachment.name}",
+                                       use_container_width=True)
+        else:
+            st.caption("Nothing attached yet.")
+
+        if active_file.name == NOTE_FILENAME:
+            extra = st.file_uploader(
+                "Attach a file to this note", key=f"attach_{active_file}",
+                help="Anything relevant — a handout, slides, a photo of the whiteboard. "
+                     "Stored inside the note's own folder.",
+            )
+            if extra is not None and st.button("📎 Attach", key=f"attach_btn_{active_file}"):
+                target = active_file.parent / Path(extra.name).name
+                if target.exists():
+                    st.warning(f"`{target.name}` is already attached to this note.")
+                else:
+                    target.write_bytes(extra.getvalue())
+                    st.session_state["flash"] = f"Attached {target.name}."
+                    st.rerun()
+        else:
+            st.caption("Attachments need the per-note folder layout; this is a legacy flat note.")
+
+    # Study & follow-up actions derived from this note
+    with st.expander("✨ Make Something From This Note", expanded=False):
+        make_cards, make_followup = st.columns(2)
+        with make_cards:
+            if st.button("📇 Make Flashcards", key=f"mk_cards_{active_file}", use_container_width=True):
+                with st.spinner(f"Writing cards with {selected_ollama}…"):
+                    try:
+                        cards = engine.generate_flashcards(note_content, count=10, model_name=selected_ollama)
+                    except Exception as exc:
+                        cards = None
+                        st.error(f"Card generation failed: {exc}")
+                if cards is not None:
+                    if cards:
+                        added = db.add_flashcards(note_category, note_filename, cards)
+                        st.session_state["flash"] = f"Added {added} card(s) — review them in the Study tab."
+                        st.rerun()
+                    else:
+                        st.warning("The model didn't return usable Q/A pairs. Try again or use a larger model.")
+        with make_followup:
+            if st.button("✉️ Draft Follow-Up", key=f"mk_fu_{active_file}", use_container_width=True):
+                with st.spinner(f"Drafting with {selected_ollama}…"):
+                    try:
+                        st.session_state["followup_draft"] = engine.generate_followup(
+                            note_content, model_name=selected_ollama)
+                        st.session_state["followup_for"] = note_title
+                        st.session_state["flash"] = "Draft ready — see the Work tab."
+                    except Exception as exc:
+                        st.error(f"Drafting failed: {exc}")
+        card_count = len([c for c in db.all_flashcards(category=note_category)
+                          if c["filename"] == note_filename])
+        if card_count:
+            st.caption(f"📇 {card_count} flashcard(s) already made from this note.")
 
     st.markdown(edited_content if 'edited_content' in locals() else note_content)
 
@@ -333,22 +618,39 @@ if active_file and active_file.exists():
             _confirm_delete_dialog(active_file)
 
 else:
-    tab_dashboard, tab_new_note, tab_settings = st.tabs(["🏠 Dashboard", "🎙️ New Note", "⚙️ Settings"])
+    tab_dashboard, tab_new_note, tab_deadlines, tab_study, tab_work, tab_settings = st.tabs(
+        ["🏠 Dashboard", "🎙️ New Note", "📅 Deadlines", "📚 Study", "✅ Work", "⚙️ Settings"]
+    )
 
     # ============================== DASHBOARD ==============================
     with tab_dashboard:
         counts = db.counts_by_category()
         total_notes = sum(counts.values())
         if total_notes:
-            # Only show categories that actually have notes, busiest first — capped so the
-            # row stays readable even if the user has added many custom categories.
-            active_categories = sorted((c for c in all_categories if counts.get(c, 0) > 0), key=lambda c: -counts[c])
-            shown_categories = active_categories[:5]
-            stat_cols = st.columns(len(shown_categories) + 2)
+            card_stats = db.flashcard_stats()
+            task_stats = db.action_item_stats()
+            due_stats = db.deadline_stats(horizon_days=7)
+            stat_cols = st.columns(5)
             stat_cols[0].metric("Total Notes", total_notes)
             stat_cols[1].metric("Words Captured", f"{db.total_word_count():,}")
-            for col, cat in zip(stat_cols[2:], shown_categories):
-                col.metric(cat, counts[cat])
+            stat_cols[2].metric(
+                "Due This Week", due_stats["due_soon"],
+                delta=f"{due_stats['overdue']} overdue" if due_stats["overdue"] else None,
+                delta_color="inverse",
+                help="Assignment deadlines from your LMS calendar, in the Deadlines tab",
+            )
+            stat_cols[3].metric("Cards Due", card_stats["due"],
+                                help="Flashcards ready to review in the Study tab")
+            stat_cols[4].metric("Open Tasks", task_stats["open"],
+                                help="Unticked action items across all your notes")
+
+            # Busiest categories, capped so the row stays readable even with many custom ones
+            active_categories = sorted((c for c in all_categories if counts.get(c, 0) > 0), key=lambda c: -counts[c])
+            shown_categories = active_categories[:6]
+            if shown_categories:
+                cat_cols = st.columns(len(shown_categories))
+                for col, cat in zip(cat_cols, shown_categories):
+                    col.metric(cat, counts[cat])
             if len(active_categories) > len(shown_categories):
                 st.caption(f"+ {len(active_categories) - len(shown_categories)} more categor{'y' if len(active_categories) - len(shown_categories) == 1 else 'ies'} with notes")
 
@@ -374,11 +676,24 @@ else:
             "Note Title",
             placeholder="e.g. Organic Chemistry Midterm Review, or Interview Debrief — Acme Corp",
         )
-        selected_template = st.selectbox("Select Prompt Template", list(all_templates.keys()))
+        # Group the picker so a 12-template list stays navigable
+        template_names = list(all_templates.keys())
+        study_first = [n for n in config.STUDY_TEMPLATES if n in template_names]
+        work_next = [n for n in config.WORK_TEMPLATES if n in template_names]
+        other = [n for n in template_names if n not in study_first + work_next]
+        ordered_templates = study_first + work_next + other
+        selected_template = st.selectbox(
+            "Select Prompt Template", ordered_templates,
+            help="Study templates come first, then work templates, then anything you've added yourself.",
+        )
         note_tags = st.text_input("🏷️ Tags (comma-separated, optional)", placeholder="e.g. midterm, chapter-4, orgo")
 
-        tab_record, tab_upload = st.tabs(["🎙️ Live Mic Record", "📁 Upload Audio File"])
+        tab_record, tab_upload, tab_import = st.tabs(
+            ["🎙️ Live Mic Record", "📁 Upload Audio File", "📄 Import a Document"]
+        )
         audio_source = None
+        imported_text = None
+        imported_file = None
 
         with tab_record:
             rec_data = st.audio_input("Record live from browser mic")
@@ -390,36 +705,78 @@ else:
             if up_data:
                 audio_source = up_data
 
+        with tab_import:
+            st.caption(
+                "Already have notes as a PDF, Word document, text file, or a photo of a "
+                "whiteboard or handout? Import it and EchoPad will structure it with the "
+                "same templates it uses for recordings. The original file is filed with the note."
+            )
+            doc_data = st.file_uploader(
+                "Import a document or image", type=importers.UPLOAD_TYPES, key="import_doc",
+            )
+            if doc_data:
+                try:
+                    extracted, import_warnings = importers.extract_text(doc_data.name, doc_data.getvalue())
+                except importers.ImportFailed as exc:
+                    st.error(str(exc))
+                else:
+                    for warning in import_warnings:
+                        st.warning(warning)
+                    if extracted.strip():
+                        imported_text, imported_file = extracted, doc_data
+                        st.success(f"Read {len(extracted.split()):,} words from `{doc_data.name}`.")
+                        with st.expander("Preview extracted text", expanded=False):
+                            st.text(extracted[:3000] + ("\n…" if len(extracted) > 3000 else ""))
+                    else:
+                        st.error(
+                            "No text could be read from that file. If it's a scanned PDF, "
+                            "export the pages as images and import those instead."
+                        )
+
+        has_source = bool(audio_source or imported_text)
         if not title:
             st.info("👆 Give your note a title to get started.")
-        elif not audio_source:
-            st.info("🎙️ Record from your mic or upload a file above to continue.")
+        elif not has_source:
+            st.info("🎙️ Record, upload audio, or import a document above to continue.")
 
-        if audio_source and title:
-            st.caption("First-time use of a Whisper model size downloads it locally — this only happens once.")
+        if has_source and title:
+            if audio_source:
+                st.caption("First-time use of a Whisper model size downloads it locally — this only happens once.")
             if st.button("✨ Process & Generate Note", type="primary"):
-                with st.status("Processing Audio...", expanded=True) as status:
-                    st.write("👂 Transcribing audio locally...")
-                    audio_bytes = audio_source.getvalue()
-                    progress_line = st.empty()
+                source_note = None
+                with st.status("Processing...", expanded=True) as status:
+                    audio_bytes = None
+                    if audio_source:
+                        st.write("👂 Transcribing audio locally...")
+                        audio_bytes = audio_source.getvalue()
+                        progress_line = st.empty()
 
-                    def _report_progress(text_so_far, segment):
-                        progress_line.caption(f"📝 ~{len(text_so_far.split())} words so far (up to {segment.end:.0f}s)...")
+                        def _report_progress(text_so_far, segment):
+                            progress_line.caption(f"📝 ~{len(text_so_far.split())} words so far (up to {segment.end:.0f}s)...")
 
-                    transcript = engine.transcribe_audio(
-                        audio_bytes,
-                        model_size=selected_whisper,
-                        translate=translate_option,
-                        on_progress=_report_progress,
-                    )
-                    progress_line.empty()
+                        transcript = engine.transcribe_audio(
+                            audio_bytes,
+                            model_size=selected_whisper,
+                            translate=translate_option,
+                            on_progress=_report_progress,
+                        )
+                        progress_line.empty()
+                    else:
+                        st.write(f"📄 Using text from `{imported_file.name}`...")
+                        transcript = imported_text
+                        source_note = importers.describe_source(imported_file.name)
 
                     st.write(f"🧠 Summarizing with {selected_ollama} ({selected_template} Template)...")
                     template_text = all_templates.get(selected_template, config.TEMPLATES["Meeting"])
                     summary = engine.generate_summary(transcript, template=template_text, model_name=selected_ollama)
                     status.update(label="Complete!", state="complete", expanded=False)
 
-                full_document = f"# {title}\n*Category: {selected_category}*\n\n{summary}\n\n---\n### 📝 Raw Transcript\n{transcript}"
+                source_line = f"\n*Source: {source_note}*" if source_note else ""
+                body_heading = "📄 Imported Text" if source_note else "📝 Raw Transcript"
+                full_document = (
+                    f"# {title}\n*Category: {selected_category}*{source_line}\n\n{summary}"
+                    f"\n\n---\n### {body_heading}\n{transcript}"
+                )
 
                 # Each note gets its own folder — e.g. notes/Lectures/organic_chemistry_midterm_review/ —
                 # so recordings, notes, and exports for that note stay together and are easy to
@@ -433,10 +790,13 @@ else:
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(full_document)
 
-                # Save Audio File for Playback
-                wav_path = note_dir / AUDIO_FILENAME
-                with open(wav_path, "wb") as f:
-                    f.write(audio_bytes)
+                # Save the source material next to the note: the recording for
+                # playback, or the original document so the note is traceable to it.
+                if audio_bytes is not None:
+                    (note_dir / AUDIO_FILENAME).write_bytes(audio_bytes)
+                elif imported_file is not None:
+                    safe_name = Path(imported_file.name).name
+                    (note_dir / f"source_{safe_name}").write_bytes(imported_file.getvalue())
 
                 # Index in DB for fast search, tags, and the dashboard...
                 db.add_note(
@@ -459,8 +819,536 @@ else:
                     created_at=saved_row["created_at"] if saved_row else None,
                 )
 
-                st.success(f"Saved note and audio to `{selected_category}/{safe_slug}/`!")
+                # Any checkbox tasks the template produced become tracked items
+                # in the Work tab straight away — no extra step, no model call.
+                task_count = _sync_action_items(md_path, full_document)
+
+                saved_what = "note and recording" if audio_bytes is not None else "note and source file"
+                st.success(f"Saved {saved_what} to `{selected_category}/{safe_slug}/`!")
+                if task_count:
+                    st.info(f"✅ Found {task_count} action item(s) — see the **Work** tab.")
                 st.markdown(full_document)
+
+    # ============================= DEADLINES ==============================
+    with tab_deadlines:
+        sources = db.lms_sources()
+
+        # Refresh quietly if a feed hasn't been checked in a while, so deadlines
+        # are current without the student having to remember to sync.
+        if sources and db.get_pref("auto_sync_feeds", default="true") == "true" \
+                and "feeds_auto_synced" not in st.session_state:
+            st.session_state["feeds_auto_synced"] = True
+            stale = [s for s in sources if _feed_is_stale(s)]
+            if stale:
+                with st.spinner(f"Refreshing {len(stale)} calendar feed(s)…"):
+                    problems = [msg for ok, msg in (_sync_feed(s) for s in stale) if not ok]
+                if problems:
+                    st.warning("Couldn't refresh a feed: " + problems[0])
+                sources = db.lms_sources()
+
+        now_local = datetime.now().astimezone()
+        stats = db.deadline_stats(horizon_days=7)
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Overdue", stats["overdue"])
+        d2.metric("Due This Week", stats["due_soon"])
+        d3.metric("Open Total", stats["open"])
+
+        show_done_deadlines = st.checkbox("Show completed", value=False, key="show_done_dl")
+        upcoming = db.deadlines(include_completed=show_done_deadlines)
+
+        if not upcoming:
+            if sources:
+                st.info("Nothing outstanding. 🎉")
+            else:
+                st.info(
+                    "No deadlines yet. Connect your LMS calendar below to pull in "
+                    "assignment due dates automatically, or add one by hand."
+                )
+        else:
+            overdue = [d for d in upcoming if not d["completed"]
+                       and _to_local(d["due_at"]) < now_local]
+            future = [d for d in upcoming if d not in overdue]
+
+            def render_deadline(item):
+                with st.container(border=True):
+                    tick_col, body_col, edit_col = st.columns([0.6, 6, 1.2])
+                    with tick_col:
+                        done = st.checkbox(
+                            "Done", value=bool(item["completed"]), key=f"dl_done_{item['id']}",
+                            label_visibility="collapsed",
+                        )
+                    with body_col:
+                        badges = []
+                        if item["course"]:
+                            badges.append(f"`{item['course']}`")
+                        if item["kind"] == "event":
+                            badges.append("📌 event")
+                        if item["user_edited"]:
+                            badges.append("✏️ edited by you")
+                        if item["source_id"] is None:
+                            badges.append("✍️ added by you")
+                        heading = f"**{item['title']}**"
+                        if item["completed"]:
+                            heading = f"~~{item['title']}~~"
+                        st.markdown(heading + ("  ·  " + " ".join(badges) if badges else ""))
+                        st.caption(_due_label(item, now_local))
+                        if item["url"]:
+                            st.caption(f"[Open in your LMS ↗]({item['url']})")
+                    with edit_col:
+                        if st.button("Edit", key=f"dl_edit_{item['id']}", use_container_width=True):
+                            _edit_deadline_dialog(item)
+                    if done != bool(item["completed"]):
+                        db.set_deadline_completed(item["id"], done)
+                        st.session_state["flash"] = "Marked done." if done else "Reopened."
+                        st.rerun()
+
+            if overdue:
+                st.markdown(f"##### ⚠️ Overdue ({len(overdue)})")
+                for item in overdue:
+                    render_deadline(item)
+
+            if future:
+                st.markdown("##### 📆 Coming Up")
+                last_header = None
+                for item in future:
+                    due = _to_local(item["due_at"])
+                    days = (due.date() - now_local.date()).days
+                    if days < 0:
+                        header = "Earlier"
+                    elif days == 0:
+                        header = "Today"
+                    elif days == 1:
+                        header = "Tomorrow"
+                    elif days <= 7:
+                        header = "This week"
+                    elif days <= 31:
+                        header = "This month"
+                    else:
+                        header = "Later"
+                    if header != last_header:
+                        st.caption(f"**{header}**")
+                        last_header = header
+                    render_deadline(item)
+
+        st.divider()
+        with st.expander("➕ Add a deadline by hand", expanded=not upcoming and not sources):
+            st.caption(
+                "For anything not in a feed — a Gradescope-only problem set, or a date "
+                "your professor only announced in class."
+            )
+            man_title = st.text_input("What's due", key="man_title",
+                                      placeholder="e.g. Problem Set 5")
+            man_course = st.text_input("Course (optional)", key="man_course",
+                                       placeholder="e.g. MATH 240")
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                man_date = st.date_input("Due date", value=date.today() + timedelta(days=7),
+                                         key="man_date")
+            with mc2:
+                man_all_day = st.checkbox("All day", value=False, key="man_allday")
+                man_time = st.time_input("Due time", value=time(23, 59), key="man_time",
+                                         disabled=man_all_day)
+            with mc3:
+                man_kind = st.selectbox("Type", ["assignment", "event"], key="man_kind")
+            if st.button("➕ Add Deadline", key="man_add", type="primary"):
+                if not man_title.strip():
+                    st.toast("Give it a title first.", icon="⚠️")
+                else:
+                    chosen = time(23, 59) if man_all_day else man_time
+                    local_due = datetime.combine(man_date, chosen).astimezone()
+                    db.add_manual_deadline(
+                        title=man_title.strip(), course=man_course.strip(),
+                        due_at=local_due.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        all_day=man_all_day, kind=man_kind,
+                    )
+                    st.session_state["flash"] = f'Added "{man_title.strip()}".'
+                    st.rerun()
+
+        with st.expander("🔗 Connect your LMS calendar", expanded=not sources):
+            st.caption(
+                "Canvas, Blackboard, Moodle and others publish a personal calendar feed "
+                "containing your assignment due dates. Subscribing to it is read-only: "
+                "EchoPad can see your deadlines and can never change anything in your LMS. "
+                "No password and no OAuth app required."
+            )
+
+            provider = st.selectbox("Which system?", list(lms.PROVIDERS), key="feed_provider")
+            st.info(lms.PROVIDERS[provider]["help"])
+            st.caption(f"It should look like: `{lms.PROVIDERS[provider]['example']}`")
+
+            feed_url = st.text_input("Calendar feed URL", key="feed_url",
+                                     placeholder="https://…  or  webcal://…")
+            feed_name = st.text_input("Label (optional)", key="feed_name",
+                                      placeholder=f"e.g. {provider} — Fall term")
+            if st.button("🔗 Connect & Sync", key="feed_connect", type="primary"):
+                try:
+                    normalized = lms.normalize_feed_url(feed_url)
+                except lms.FeedError as exc:
+                    st.error(str(exc))
+                else:
+                    with st.spinner("Fetching your calendar…"):
+                        source_id = db.add_lms_source(
+                            feed_name.strip() or provider, provider, normalized)
+                        ok, message = _sync_feed(db.get_lms_source(source_id))
+                    if ok:
+                        st.session_state["flash"] = message
+                        st.rerun()
+                    else:
+                        # Don't leave a broken feed connected on a first attempt
+                        db.delete_lms_source(source_id)
+                        st.error(message)
+
+            st.markdown(lms.GRADESCOPE_NOTE)
+
+            st.caption(
+                "⚠️ Treat a feed URL like a password: anyone with it can read your "
+                "calendar. It's stored locally on this computer only. If you ever paste "
+                "it somewhere by mistake, reset it in your LMS and reconnect."
+            )
+
+        if sources:
+            with st.expander(f"🔄 Connected feeds ({len(sources)})", expanded=False):
+                auto = db.get_pref("auto_sync_feeds", default="true") == "true"
+                new_auto = st.checkbox(
+                    f"Refresh automatically when older than {FEED_STALE_HOURS} hours",
+                    value=auto, key="auto_sync_feeds_cb",
+                )
+                if new_auto != auto:
+                    db.set_pref("auto_sync_feeds", "true" if new_auto else "false")
+                    st.rerun()
+
+                for source in sources:
+                    with st.container(border=True):
+                        info_col, sync_col, del_col = st.columns([4, 1, 1])
+                        with info_col:
+                            st.markdown(f"**{source['name']}** · {source['provider']}")
+                            last = source["last_synced"]
+                            when = _to_local(last).strftime("%d %b %H:%M") if last else "never"
+                            status = source["last_status"] or "not synced yet"
+                            icon = "✅" if status == "ok" else "⚠️"
+                            st.caption(
+                                f"{icon} last checked {when} · {source['event_count']} entr"
+                                f"{'y' if source['event_count'] == 1 else 'ies'}"
+                            )
+                            if status != "ok" and status != "not synced yet":
+                                st.caption(status)
+                        with sync_col:
+                            if st.button("Sync", key=f"sync_{source['id']}",
+                                         use_container_width=True):
+                                with st.spinner("Syncing…"):
+                                    ok, message = _sync_feed(source)
+                                st.session_state["flash"] = message
+                                st.rerun()
+                        with del_col:
+                            if st.button("Remove", key=f"rmfeed_{source['id']}",
+                                         use_container_width=True):
+                                db.delete_lms_source(source["id"])
+                                st.session_state["flash"] = f"Disconnected {source['name']}."
+                                st.rerun()
+                st.caption(
+                    "Removing a feed deletes the deadlines that came from it. Deadlines you "
+                    "added or edited yourself are kept."
+                )
+
+    # =============================== STUDY ================================
+    with tab_study:
+        all_notes = db.search("")
+        card_stats = db.flashcard_stats()
+
+        st.markdown("#### 📇 Flashcards")
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Cards", card_stats["total"])
+        s2.metric("Due Now", card_stats["due"])
+        s3.metric("Reviewed At Least Once", card_stats["reviewed"])
+
+        if not all_notes:
+            st.info("Save a note first — flashcards are generated from your own notes.")
+        else:
+            with st.expander("➕ Generate cards from a note", expanded=not card_stats["total"]):
+                note_labels = {f"{n['title']} — {n['category']}": n for n in all_notes}
+                chosen_label = st.selectbox("Note", list(note_labels), key="fc_note")
+                how_many = st.slider("How many cards", 5, 25, 10, key="fc_count")
+                if st.button("✨ Generate Flashcards", key="fc_generate"):
+                    note = note_labels[chosen_label]
+                    body = _read_note(note["category"], note["filename"])
+                    if not body.strip():
+                        st.error("That note's file couldn't be read.")
+                    else:
+                        with st.spinner(f"Writing {how_many} cards with {selected_ollama}…"):
+                            try:
+                                cards = engine.generate_flashcards(
+                                    body, count=how_many, model_name=selected_ollama)
+                            except Exception as exc:
+                                cards = None
+                                st.error(f"Card generation failed: {exc}")
+                        if cards is not None:
+                            if not cards:
+                                st.warning(
+                                    "The model didn't return anything in the expected Q/A format. "
+                                    "Trying again, or switching to a larger Ollama model, usually fixes it."
+                                )
+                            else:
+                                added = db.add_flashcards(note["category"], note["filename"], cards)
+                                skipped = len(cards) - added
+                                msg = f"Added {added} card(s) from “{note['title']}”."
+                                if skipped:
+                                    msg += f" {skipped} were already saved."
+                                st.session_state["flash"] = msg
+                                st.rerun()
+
+            # ---- Review session ----
+            due = db.due_flashcards(limit=1)
+            if card_stats["total"] and not due:
+                st.success("🎉 Nothing due right now — everything's scheduled for later.")
+            elif due:
+                card = due[0]
+                st.markdown(f"##### Review — {card_stats['due']} card(s) due")
+                with st.container(border=True):
+                    st.markdown(f"**{card['question']}**")
+                    revealed = st.session_state.get("revealed_card") == card["id"]
+                    if not revealed:
+                        if st.button("Show answer", key="fc_reveal", use_container_width=True):
+                            st.session_state["revealed_card"] = card["id"]
+                            st.rerun()
+                    else:
+                        st.info(card["answer"])
+                        st.caption(
+                            f"Seen {card['reps']}× · ease {card['ease']:.2f}"
+                            + (f" · lapsed {card['lapses']}×" if card["lapses"] else "")
+                        )
+                        g1, g2, g3 = st.columns(3)
+                        grades = (("😖 Again", "again", g1), ("🙂 Good", "good", g2), ("😎 Easy", "easy", g3))
+                        for label, grade, column in grades:
+                            with column:
+                                if st.button(label, key=f"fc_{grade}", use_container_width=True):
+                                    result = db.review_flashcard(card["id"], grade)
+                                    st.session_state.pop("revealed_card", None)
+                                    when = "again today" if result["interval_days"] == 0 else f"in {result['interval_days']} day(s)"
+                                    st.session_state["flash"] = f"Scheduled {when}."
+                                    st.rerun()
+
+            if card_stats["total"]:
+                rows = db.all_flashcards()
+                buffer = io.StringIO()
+                writer = csv.writer(buffer)
+                writer.writerow(["Question", "Answer", "Category", "Source Note", "Due"])
+                for row in rows:
+                    writer.writerow([row["question"], row["answer"], row["category"],
+                                     row["filename"], row["due_at"]])
+                st.download_button(
+                    "⬇️ Export all cards (.csv for Anki / Quizlet)",
+                    data=buffer.getvalue(), file_name="echopad_flashcards.csv", mime="text/csv",
+                    key="fc_export",
+                )
+
+        st.divider()
+        st.markdown("#### 📖 Build a Study Guide")
+        st.caption(
+            "Merge several notes into one revision document — grouped by theme rather than "
+            "by lecture, with a glossary, likely exam questions, and the topics your notes "
+            "cover only thinly. Saved as a new note."
+        )
+        if len(all_notes) < 2:
+            st.info("You'll need at least two saved notes to merge.")
+        else:
+            guide_labels = {f"{n['title']} — {n['category']}": n for n in all_notes}
+            picked_labels = st.multiselect(
+                "Notes to merge", list(guide_labels),
+                help="Pick the lectures and readings for one exam or topic.",
+                key="guide_notes",
+            )
+            guide_title = st.text_input(
+                "Title for the study guide", key="guide_title",
+                placeholder="e.g. BIO 201 Midterm 2 — Study Guide",
+            )
+            guide_category = st.selectbox("Save it under", all_categories, key="guide_cat")
+            if st.button("📚 Build Study Guide", key="guide_build", type="primary",
+                         disabled=len(picked_labels) < 2 or not guide_title.strip()):
+                sections = []
+                for label in picked_labels:
+                    note = guide_labels[label]
+                    body = _read_note(note["category"], note["filename"])
+                    if body.strip():
+                        sections.append((note["title"], body))
+                if len(sections) < 2:
+                    st.error("Couldn't read enough of those notes from disk.")
+                else:
+                    with st.spinner(f"Merging {len(sections)} notes with {selected_ollama}…"):
+                        try:
+                            guide = engine.synthesize_notes(
+                                sections, config.STUDY_GUIDE_PROMPT, model_name=selected_ollama)
+                        except Exception as exc:
+                            guide = None
+                            st.error(f"Study guide generation failed: {exc}")
+                    if guide:
+                        clean_title = guide_title.strip()
+                        guide_dir = config.STORAGE_DIR / guide_category
+                        guide_dir.mkdir(parents=True, exist_ok=True)
+                        slug = storage.unique_slug(guide_dir, storage.slugify(clean_title))
+                        target_dir = guide_dir / slug
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        sources = "\n".join(f"- {t}" for t, _ in sections)
+                        document = (
+                            f"# {clean_title}\n*Category: {guide_category}*\n"
+                            f"*Built from {len(sections)} notes*\n\n{guide}\n\n---\n"
+                            f"### 📎 Built From\n{sources}\n"
+                        )
+                        md_file = target_dir / NOTE_FILENAME
+                        md_file.write_text(document, encoding="utf-8")
+                        db.add_note(title=clean_title, category=guide_category,
+                                    filename=f"{slug}/{NOTE_FILENAME}", template="Study Guide",
+                                    tags="study-guide", word_count=len(document.split()))
+                        row = db.get_note(guide_category, f"{slug}/{NOTE_FILENAME}")
+                        storage.write_note_meta(
+                            md_file, NOTE_FILENAME, title=clean_title, tags="study-guide",
+                            template="Study Guide", word_count=len(document.split()),
+                            created_at=row["created_at"] if row else None)
+                        st.session_state["selected_file"] = md_file
+                        st.session_state["flash"] = f'Built “{clean_title}”.'
+                        st.rerun()
+
+    # ================================ WORK ================================
+    with tab_work:
+        task_stats = db.action_item_stats()
+        w1, w2, w3 = st.columns(3)
+        w1.metric("Open", task_stats["open"])
+        w2.metric("Completed", task_stats["done"])
+        w3.metric("Total Tracked", task_stats["total"])
+
+        st.markdown("#### ✅ Action Items")
+        st.caption(
+            "Pulled from the checkboxes in your notes. Ticking one here also ticks it in the "
+            "note file itself, so the note stays the record of what's outstanding."
+        )
+
+        show_done = st.checkbox("Show completed items too", value=False, key="show_done_tasks")
+        items = db.action_items(include_done=show_done)
+
+        if not items:
+            st.info(
+                "No action items yet. Templates like **Meeting**, **One-on-One**, and "
+                "**Client / Discovery Call** produce them automatically — or add "
+                "`- [ ] Task` lines to any note yourself and rescan below."
+            )
+        else:
+            by_note = {}
+            for item in items:
+                by_note.setdefault((item["category"], item["filename"]), []).append(item)
+
+            for (category, filename), note_items in by_note.items():
+                note_row = db.get_note(category, filename)
+                heading = note_row["title"] if note_row else filename
+                with st.container(border=True):
+                    head_col, open_col = st.columns([5, 1])
+                    head_col.markdown(f"**📄 {heading}** · {category}")
+                    with open_col:
+                        if st.button("Open →", key=f"task_open_{category}_{filename}",
+                                     use_container_width=True):
+                            st.session_state["selected_file"] = _note_path(category, filename)
+                            st.rerun()
+                    for item in note_items:
+                        checked = st.checkbox(
+                            item["text"], value=bool(item["done"]), key=f"task_{item['id']}",
+                        )
+                        meta_bits = []
+                        if item["owner"]:
+                            meta_bits.append(f"👤 {item['owner']}")
+                        if item["due"]:
+                            meta_bits.append(f"📅 {item['due']}")
+                        if meta_bits:
+                            st.caption(" · ".join(meta_bits))
+                        if checked != bool(item["done"]):
+                            if _complete_action_item(item, checked):
+                                st.session_state["flash"] = (
+                                    "Marked done." if checked else "Reopened."
+                                )
+                            else:
+                                st.session_state["flash"] = (
+                                    "That line has changed in the note — rescan to resync."
+                                )
+                            st.rerun()
+
+        if st.button("🔄 Rescan all notes for action items", key="rescan_tasks",
+                     help="Runs automatically at startup — use this after editing notes "
+                          "outside the app in the same session."):
+            st.session_state["flash"] = f"Rescanned {_resync_all_action_items()} note(s)."
+            st.rerun()
+
+        st.divider()
+        st.markdown("#### ✉️ Draft a Follow-Up")
+        st.caption(
+            "Turn a meeting, interview, or networking note into a follow-up email you can "
+            "edit and send — referencing what was actually discussed."
+        )
+        followup_notes = db.search("")
+        if not followup_notes:
+            st.info("Save a note first.")
+        else:
+            fu_labels = {f"{n['title']} — {n['category']}": n for n in followup_notes}
+            fu_choice = st.selectbox("From note", list(fu_labels), key="fu_note")
+            fu_tone = st.selectbox(
+                "Tone", ["warm but professional", "brief and direct", "formal", "enthusiastic"],
+                key="fu_tone",
+            )
+            if st.button("✉️ Draft Follow-Up", key="fu_generate"):
+                note = fu_labels[fu_choice]
+                body = _read_note(note["category"], note["filename"])
+                if not body.strip():
+                    st.error("That note's file couldn't be read.")
+                else:
+                    with st.spinner(f"Drafting with {selected_ollama}…"):
+                        try:
+                            st.session_state["followup_draft"] = engine.generate_followup(
+                                body, tone=fu_tone, model_name=selected_ollama)
+                            st.session_state["followup_for"] = note["title"]
+                        except Exception as exc:
+                            st.error(f"Drafting failed: {exc}")
+
+            if st.session_state.get("followup_draft"):
+                st.text_area(
+                    f"Draft for “{st.session_state.get('followup_for', '')}” — edit before sending",
+                    value=st.session_state["followup_draft"], height=280, key="fu_draft_box",
+                )
+                st.download_button(
+                    "⬇️ Download draft (.txt)", data=st.session_state["fu_draft_box"],
+                    file_name="follow_up.txt", mime="text/plain", key="fu_download",
+                )
+                st.caption("EchoPad never sends anything — copy it into your own email client.")
+
+        st.divider()
+        st.markdown("#### 🗓️ Weekly Digest")
+        st.caption(
+            "Summarize what you actually did over a period, across every note — useful for "
+            "a status update, a standup, or a 1:1 agenda."
+        )
+        digest_days = st.selectbox("Period", [7, 14, 30], format_func=lambda d: f"Last {d} days",
+                                   key="digest_days")
+        if st.button("🗓️ Build Digest", key="digest_build"):
+            cutoff = (date.today() - timedelta(days=int(digest_days))).isoformat()
+            recent = [n for n in db.search("") if (n["created_at"] or "")[:10] >= cutoff]
+            if not recent:
+                st.warning(f"No notes saved in the last {digest_days} days.")
+            else:
+                sections = []
+                for note in recent:
+                    body = _read_note(note["category"], note["filename"])
+                    if body.strip():
+                        sections.append((f"{note['title']} ({note['created_at'][:10]})", body))
+                with st.spinner(f"Summarizing {len(sections)} note(s) with {selected_ollama}…"):
+                    try:
+                        st.session_state["digest_text"] = engine.synthesize_notes(
+                            sections, config.DIGEST_PROMPT, model_name=selected_ollama)
+                        st.session_state["digest_count"] = len(sections)
+                    except Exception as exc:
+                        st.error(f"Digest generation failed: {exc}")
+
+        if st.session_state.get("digest_text"):
+            st.caption(f"From {st.session_state.get('digest_count', 0)} note(s):")
+            st.markdown(st.session_state["digest_text"])
+            st.download_button(
+                "⬇️ Download digest (.md)", data=st.session_state["digest_text"],
+                file_name="weekly_digest.md", mime="text/markdown", key="digest_download",
+            )
 
     # ============================== SETTINGS ==============================
     with tab_settings:

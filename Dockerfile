@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# ffmpeg decodes the audio; tesseract reads text out of imported images.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
