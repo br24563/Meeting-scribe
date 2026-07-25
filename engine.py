@@ -96,15 +96,56 @@ def convert_md_to_html(md_text: str) -> str:
     """Convert Markdown to clean HTML."""
     return markdown.markdown(md_text, extensions=['extra'])
 
+_MD_INLINE_MARKERS = re.compile(r"(\*\*|__|\*|_|`|~~)")
+
+
+def _pdf_safe(text: str) -> str:
+    """PDF core fonts are Latin-1 only. Drop what they can't represent (the
+    emoji used in note templates) instead of rendering it as '?' noise."""
+    return text.encode("latin-1", "ignore").decode("latin-1")
+
+
 def convert_md_to_pdf(md_text: str, output_path: str):
-    """Convert raw markdown text to standard PDF."""
+    """Render a note's Markdown to a readable PDF.
+
+    Headings, quotes, and bullets keep their shape rather than being flattened.
+    Each line is written at the left margin with an explicit line break —
+    fpdf2 2.8 leaves the cursor at the right margin by default, which makes a
+    following full-width cell fail with "not enough horizontal space".
+    """
     pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.set_font("Helvetica", size=11)
-    
-    # Strip markdown headers/bold syntax for simple PDF export
-    clean_text = re.sub(r'[#*`>-]', '', md_text)
-    
-    for line in clean_text.split('\n'):
-        pdf.multi_cell(0, 8, txt=line.encode('latin-1', 'replace').decode('latin-1'))
+
+    for raw_line in md_text.split("\n"):
+        line = raw_line.strip()
+
+        if not line:
+            pdf.ln(4)
+            continue
+        if len(line) >= 3 and set(line) <= set("-*_"):  # horizontal rule
+            pdf.ln(3)
+            continue
+
+        size, style, height = 11, "", 6
+        heading = re.match(r"^(#{1,6})\s*(.*)$", line)
+        if heading:
+            level = len(heading.group(1))
+            line = heading.group(2)
+            size, style, height = max(18 - 2 * level, 11), "B", 8
+        elif line.startswith(">"):
+            line = line.lstrip("> ").strip()
+            style = "I"
+        elif re.match(r"^[-*+]\s+", line):
+            line = "- " + re.sub(r"^[-*+]\s+", "", line)
+
+        text = _pdf_safe(_MD_INLINE_MARKERS.sub("", line)).strip()
+        if not text:
+            pdf.ln(3)
+            continue
+
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, height, text, new_x="LMARGIN", new_y="NEXT")
+
     pdf.output(output_path)

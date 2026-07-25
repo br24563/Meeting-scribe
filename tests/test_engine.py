@@ -26,3 +26,34 @@ def test_md_to_html_conversion():
     md = "# Hello World"
     html = engine.convert_md_to_html(md)
     assert "<h1>Hello World</h1>" in html
+
+
+def test_md_to_pdf_renders_a_realistic_multiline_note(tmp_path):
+    """Regression guard: a full note has many lines, headings, quotes, rules and
+    emoji. fpdf2 2.8 leaves the cursor at the right margin after each cell, so a
+    naive full-width multi_cell loop raises "not enough horizontal space" on the
+    second line — and the template emoji can't be encoded by the core fonts."""
+    note = (
+        "# Organic Chemistry Midterm Review\n"
+        "*Category: Lectures*\n\n"
+        "> 💡 **Core Thesis**\n"
+        "> Reaction mechanisms follow electron flow.\n\n"
+        "---\n"
+        "### 📖 Key Concepts\n"
+        "* **Nucleophile:** an electron-rich species.\n"
+        "* **Electrophile:** electron-poor, accepts a pair.\n\n"
+        "- [ ] Review chapter 4 problems\n"
+    )
+    out = tmp_path / "note.pdf"
+    engine.convert_md_to_pdf(note, str(out))
+
+    assert out.exists()
+    assert out.read_bytes().startswith(b"%PDF")
+    assert out.stat().st_size > 500  # real content, not an empty page
+
+
+def test_md_to_pdf_handles_empty_and_symbol_only_input(tmp_path):
+    for content in ("", "\n\n\n", "---\n***\n", "😀🎉"):
+        out = tmp_path / "edge.pdf"
+        engine.convert_md_to_pdf(content, str(out))
+        assert out.read_bytes().startswith(b"%PDF")

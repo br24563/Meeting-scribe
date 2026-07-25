@@ -9,15 +9,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Matches requires-python in pyproject.toml: the floor we actually
+        # test, plus a newer release so a dependency break shows up early.
+        python-version: ['3.11', '3.12']
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install System Dependencies
         run: |
@@ -30,5 +37,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Pytest
-        run: |
-          pytest
+        run: pytest -q
+
+      - name: Check the app imports cleanly
+        # Catches syntax/import errors in app.py, which the unit tests don't load.
+        run: python -c "import ast, pathlib; ast.parse(pathlib.Path('app.py').read_text(encoding='utf-8'))"

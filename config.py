@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -5,8 +6,52 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-STORAGE_DIR = Path(os.environ.get("ECHOPAD_STORAGE_DIR", "./notes"))
-STORAGE_DIR.mkdir(exist_ok=True)
+# Machine-level app config (chosen notes location, the search index). Kept
+# separate from the notes themselves so the notes folder stays portable — and
+# so it can live somewhere cloud-synced without dragging a live SQLite file
+# along with it. See db.index_path() and the README's storage section.
+APP_CONFIG_DIR = Path(os.environ.get("ECHOPAD_CONFIG_DIR", Path.home() / ".echopad")).expanduser()
+LOCATION_FILE = APP_CONFIG_DIR / "location.json"
+DEFAULT_STORAGE_DIR = Path("./notes")
+
+
+def storage_dir_is_pinned() -> bool:
+    """True when the notes location is fixed by the environment (Docker, or an
+    explicit .env), in which case the UI shouldn't offer to move it."""
+    return bool(os.environ.get("ECHOPAD_STORAGE_DIR"))
+
+
+def _saved_storage_dir():
+    try:
+        saved = json.loads(LOCATION_FILE.read_text(encoding="utf-8")).get("storage_dir")
+    except (OSError, ValueError):
+        return None
+    return Path(saved).expanduser() if saved else None
+
+
+def resolve_storage_dir() -> Path:
+    """Precedence: environment > location saved from the Settings tab > default."""
+    from_env = os.environ.get("ECHOPAD_STORAGE_DIR")
+    if from_env:
+        return Path(from_env).expanduser()
+    return _saved_storage_dir() or DEFAULT_STORAGE_DIR
+
+
+def set_storage_dir(new_dir) -> Path:
+    """Persist a new notes location and update STORAGE_DIR in place, so the
+    running app picks it up on its next rerun without a restart."""
+    global STORAGE_DIR
+    new_dir = Path(new_dir).expanduser()
+    new_dir.mkdir(parents=True, exist_ok=True)
+    APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LOCATION_FILE.write_text(json.dumps({"storage_dir": str(new_dir)}, indent=2), encoding="utf-8")
+    STORAGE_DIR = new_dir
+    return new_dir
+
+
+APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR = resolve_storage_dir()
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 WHISPER_MODELS = ["tiny", "base", "small"]
 DEFAULT_WHISPER_MODEL = os.environ.get("ECHOPAD_WHISPER_MODEL", "base")

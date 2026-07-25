@@ -1,6 +1,5 @@
 import io
 import os
-import re
 import shutil
 import tempfile
 import zipfile
@@ -9,6 +8,7 @@ from pathlib import Path
 import config
 import db
 import engine
+import storage
 
 APP_VERSION = "0.3.0"
 NOTE_FILENAME = "note.md"
@@ -50,12 +50,17 @@ def _effective_ollama_models():
 
 
 def _build_backup_zip() -> bytes:
-    """Zip every file under STORAGE_DIR (notes, audio, and the index) for backup/export."""
+    """Zip the whole library for backup/export: every note and recording, plus
+    the index — which lives outside the notes folder but holds the tags, so a
+    backup without it would silently lose them."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in config.STORAGE_DIR.rglob("*"):
             if path.is_file():
-                zf.write(path, arcname=path.relative_to(config.STORAGE_DIR))
+                zf.write(path, arcname=Path("notes") / path.relative_to(config.STORAGE_DIR))
+        index = db.index_path()
+        if index.exists():
+            zf.write(index, arcname="echopad-index.db")
     return buf.getvalue()
 
 
@@ -66,9 +71,10 @@ def _delete_note(md_path: Path) -> None:
         # Per-note folder layout: remove the whole folder (note + audio + anything else in it).
         shutil.rmtree(md_path.parent, ignore_errors=True)
     else:
-        # Legacy flat layout: only this note's own two files live in the category folder.
+        # Legacy flat layout: this note's own files live in the category folder.
         md_path.unlink(missing_ok=True)
         _audio_path(md_path).unlink(missing_ok=True)
+        storage.meta_path(md_path, NOTE_FILENAME).unlink(missing_ok=True)
     db.delete_note(category, filename)
 
 
@@ -88,17 +94,66 @@ def _confirm_delete_dialog(md_path: Path):
             st.rerun()
 
 
+@st.dialog("Change where notes are stored")
+def _confirm_storage_dialog(target: Path, note_count: int):
+    st.caption("New location:")
+    st.code(str(target), language=None)
+
+    move_label = f"Move my {note_count} existing note{'s' if note_count != 1 else ''} there"
+    choice = move_label if note_count else "Switch without moving anything"
+    if note_count:
+        choice = st.radio(
+            "What should happen to the notes already saved?",
+            [move_label, "Leave them where they are (start fresh in the new folder)"],
+            index=0,
+        )
+    st.caption(
+        "Notes are copied and verified before anything is removed — if a copy fails, "
+        "the move is rolled back and your current folder is left untouched."
+    )
+
+    col_cancel, col_confirm = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    with col_confirm:
+        if st.button("✅ Use This Location", type="primary", use_container_width=True):
+            messages = []
+            if note_count and choice == move_label:
+                result = storage.move_library(config.STORAGE_DIR, target)
+                if result["failed"]:
+                    first = result["failed"][0]
+                    st.error(
+                        f"Couldn't move `{first['file']}` ({first['error']}). "
+                        "Nothing was changed — your notes are still in the current folder."
+                    )
+                    return
+                messages.append(f"moved {result['moved']} file(s)")
+                if result["conflicts"]:
+                    messages.append(
+                        f"skipped {len(result['conflicts'])} already present at the destination"
+                    )
+            config.set_storage_dir(target)
+            db.migrate_legacy_index()
+            st.session_state.pop("index_synced", None)  # re-index against the new location
+            st.session_state["selected_file"] = None
+            detail = f" ({', '.join(messages)})" if messages else ""
+            st.session_state["flash"] = f"Notes now stored in {target}{detail}."
+            st.rerun()
+
+
 st.set_page_config(page_title="EchoPad", page_icon="🎙️", layout="wide")
 
 if not engine.check_ollama_status():
     st.error("⚠️ **Ollama is not running!** Please start Ollama (`ollama serve`) and refresh.")
     st.stop()
 
-# Sync the index with whatever's actually on disk: drop entries for notes
-# that were renamed/moved/deleted outside the app, then index anything new
-# (including a just-renamed folder, under its new name). Cheap, so we only
-# do it once per session.
+# Sync the index with whatever's actually on disk: adopt an index from an older
+# version, drop entries for notes renamed/moved/deleted outside the app, then
+# index anything new — including notes synced down from another machine via
+# OneDrive/Google Drive. Cheap, so we only do it once per session.
 if "index_synced" not in st.session_state:
+    db.migrate_legacy_index()
     db.prune_missing()
     db.rebuild_from_disk()
     st.session_state["index_synced"] = True
@@ -200,15 +255,43 @@ if active_file and active_file.exists():
     with open(active_file, "r", encoding="utf-8") as f:
         note_content = f.read()
 
-    # Tags
     note_category, note_filename = db.relative_key(active_file)
     current_row = db.get_note(note_category, note_filename)
+    st.caption(
+        f"{note_category} · {len(note_content.split()):,} words"
+        + (f" · saved {current_row['created_at']}" if current_row else "")
+    )
+
+    # Tags
     current_tags = current_row["tags"] if current_row else ""
     new_tags = st.text_input("🏷️ Tags (comma-separated)", value=current_tags, key=f"tags_{active_file}")
     if new_tags != current_tags:
         db.update_tags(note_category, note_filename, new_tags)
+        storage.write_note_meta(active_file, NOTE_FILENAME, tags=new_tags)
         st.session_state["flash"] = "Tags updated."
         st.rerun()
+
+    # Rename — keeps the folder name, index entry, and title in step
+    with st.expander("🏷️ Rename Note", expanded=False):
+        st.caption("Renaming also renames the note's folder on disk, so it stays easy to find.")
+        rename_to = st.text_input("New title", value=note_title, key=f"rename_{active_file}")
+        if st.button("Rename", key=f"rename_btn_{active_file}"):
+            cleaned = rename_to.strip()
+            if not cleaned:
+                st.toast("Enter a title first.", icon="⚠️")
+            elif cleaned == note_title:
+                st.toast("That's already the title.", icon="ℹ️")
+            else:
+                try:
+                    new_md, new_key = storage.rename_note(active_file, cleaned, NOTE_FILENAME)
+                except (OSError, FileExistsError) as exc:
+                    st.error(f"Couldn't rename: {exc}")
+                else:
+                    db.rename_note(note_category, note_filename, new_key, cleaned)
+                    storage.write_note_meta(new_md, NOTE_FILENAME, title=cleaned)
+                    st.session_state["selected_file"] = new_md
+                    st.session_state["flash"] = f'Renamed to "{cleaned}".'
+                    st.rerun()
 
     # Interactive In-App Editor
     with st.expander("✏️ Edit Note Content", expanded=False):
@@ -216,6 +299,8 @@ if active_file and active_file.exists():
         if st.button("💾 Save Changes"):
             with open(active_file, "w", encoding="utf-8") as f:
                 f.write(edited_content)
+            db.update_word_count(note_category, note_filename, len(edited_content.split()))
+            storage.write_note_meta(active_file, NOTE_FILENAME, word_count=len(edited_content.split()))
             st.session_state["flash"] = "Note updated successfully."
             st.rerun()
 
@@ -258,10 +343,11 @@ else:
             # Only show categories that actually have notes, busiest first — capped so the
             # row stays readable even if the user has added many custom categories.
             active_categories = sorted((c for c in all_categories if counts.get(c, 0) > 0), key=lambda c: -counts[c])
-            shown_categories = active_categories[:6]
-            stat_cols = st.columns(len(shown_categories) + 1)
+            shown_categories = active_categories[:5]
+            stat_cols = st.columns(len(shown_categories) + 2)
             stat_cols[0].metric("Total Notes", total_notes)
-            for col, cat in zip(stat_cols[1:], shown_categories):
+            stat_cols[1].metric("Words Captured", f"{db.total_word_count():,}")
+            for col, cat in zip(stat_cols[2:], shown_categories):
                 col.metric(cat, counts[cat])
             if len(active_categories) > len(shown_categories):
                 st.caption(f"+ {len(active_categories) - len(shown_categories)} more categor{'y' if len(active_categories) - len(shown_categories) == 1 else 'ies'} with notes")
@@ -338,13 +424,7 @@ else:
                 # Each note gets its own folder — e.g. notes/Lectures/organic_chemistry_midterm_review/ —
                 # so recordings, notes, and exports for that note stay together and are easy to
                 # browse in Windows/Mac file explorers, right alongside the app.
-                base_slug = re.sub(r'[<>:"/\\|?*]', '', title.lower().strip()).replace(' ', '_').strip('_') or "untitled"
-                safe_slug = base_slug
-                suffix = 1
-                while (cat_dir / safe_slug).exists():
-                    suffix += 1
-                    safe_slug = f"{base_slug}_{suffix}"
-
+                safe_slug = storage.unique_slug(cat_dir, storage.slugify(title))
                 note_dir = cat_dir / safe_slug
                 note_dir.mkdir(parents=True, exist_ok=True)
 
@@ -358,13 +438,25 @@ else:
                 with open(wav_path, "wb") as f:
                     f.write(audio_bytes)
 
-                # Index in DB for fast search, tags, and the dashboard
+                # Index in DB for fast search, tags, and the dashboard...
                 db.add_note(
                     title=title,
                     category=selected_category,
                     filename=f"{safe_slug}/{NOTE_FILENAME}",
                     template=selected_template,
                     tags=note_tags.strip(),
+                    word_count=len(full_document.split()),
+                )
+                # ...and alongside the note itself, so the folder stays
+                # self-describing if it's moved, synced, or re-indexed.
+                saved_row = db.get_note(selected_category, f"{safe_slug}/{NOTE_FILENAME}")
+                storage.write_note_meta(
+                    md_path, NOTE_FILENAME,
+                    title=title,
+                    tags=note_tags.strip(),
+                    template=selected_template,
+                    word_count=len(full_document.split()),
+                    created_at=saved_row["created_at"] if saved_row else None,
                 )
 
                 st.success(f"Saved note and audio to `{selected_category}/{safe_slug}/`!")
@@ -485,6 +577,78 @@ else:
                     del st.session_state["new_ollama_model_input"]
                     st.session_state["flash"] = f'Added "{name}" to your Ollama model list.'
                     st.rerun()
+
+        st.divider()
+        st.markdown("#### ☁️ Storage Location & Cloud Sync")
+        st.caption("Where your notes and recordings are kept on this computer.")
+        st.code(str(config.STORAGE_DIR.resolve()), language=None)
+
+        if config.storage_dir_is_pinned():
+            st.info(
+                "The location is set by the `ECHOPAD_STORAGE_DIR` environment variable "
+                "(this is how the Docker one-click launcher runs). Change it in your "
+                "`.env` or `docker-compose.yml` rather than here."
+            )
+        else:
+            providers = storage.detect_providers()
+            options = ["This computer only (default folder)"]
+            targets = [Path("./notes").resolve()]
+            for provider in providers:
+                options.append(f"{provider['label']} — synced to the cloud")
+                targets.append(storage.library_path_for(provider["path"]))
+            options.append("Custom folder…")
+            targets.append(None)
+
+            if providers:
+                st.caption(
+                    "Because EchoPad stores plain files, pointing it at a folder your cloud app "
+                    "already syncs gives you cross-device access, version history, and off-device "
+                    "backup — with no sign-in, API keys, or account access needed here. "
+                    "Notes kept in a synced folder do leave this machine and reach that provider; "
+                    "the default folder stays fully local."
+                )
+            else:
+                st.caption(
+                    "No OneDrive, Google Drive, iCloud, or Dropbox folder was detected on this "
+                    "computer. Install the provider's desktop sync app (e.g. OneDrive, or Google "
+                    "Drive for Desktop), then reopen this tab — or point EchoPad at any folder "
+                    "with the custom option."
+                )
+
+            picked = st.radio("Keep my notes in:", options, index=0, key="storage_choice")
+            picked_target = targets[options.index(picked)]
+
+            if picked_target is None:
+                custom_path = st.text_input(
+                    "Folder path", key="custom_storage_path",
+                    placeholder=r"e.g. D:\Dropbox\EchoPad  or  /Users/you/Documents/EchoPad",
+                )
+                picked_target = Path(custom_path.strip()).expanduser() if custom_path.strip() else None
+                if picked_target:
+                    st.caption(
+                        "Pick a folder used only for EchoPad. Pointing at a large shared root "
+                        "(your whole OneDrive, say) would make EchoPad scan everything in it."
+                    )
+
+            if picked_target:
+                already_here = False
+                try:
+                    already_here = picked_target.resolve() == config.STORAGE_DIR.resolve()
+                except OSError:
+                    pass
+                st.caption("Notes would be stored in:")
+                st.code(str(picked_target), language=None)
+                if already_here:
+                    st.caption("✅ That's already your current location.")
+                elif st.button("📂 Use This Location", key="use_storage_btn"):
+                    _confirm_storage_dialog(picked_target, sum(db.counts_by_category().values()))
+
+            st.caption(
+                "Each note folder carries its own `meta.json` with its title and tags, so those "
+                "travel with the note when it moves or syncs to another computer. The search "
+                "index itself stays on this machine and rebuilds from those files, since sync "
+                "clients can corrupt a live database. App preferences remain per-computer."
+            )
 
         st.divider()
         st.markdown("#### 🎨 Display")

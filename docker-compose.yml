@@ -28,9 +28,18 @@ services:
     ports:
       - "8501:8501"
     volumes:
+      # Your notes land in ./notes on the host, so they outlive the container.
       - ./notes:/app/notes
+      # Preferences and the search index would otherwise live in the
+      # container's throwaway home directory and reset on every restart.
+      - echopad_config:/root/.echopad
     environment:
       - OLLAMA_HOST=http://ollama:11434
+      # Pinning the notes path keeps the Settings tab from offering to move
+      # them somewhere outside the mount above, which wouldn't survive
+      # `docker compose down`. Settings shows it as environment-controlled.
+      - ECHOPAD_STORAGE_DIR=/app/notes
+      - ECHOPAD_CONFIG_DIR=/root/.echopad
     depends_on:
       ollama:
         condition: service_healthy
@@ -39,3 +48,4 @@ services:
 
 volumes:
   ollama_data:
+  echopad_config:

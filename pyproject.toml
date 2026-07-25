@@ -3,7 +3,8 @@ name = "echopad"
 version = "0.3.0"
 description = "The private, local-first AI voice notebook for students and young professionals."
 readme = "README.md"
-requires-python = ">=3.10"
+# The floor CI actually exercises — see .github/workflows/ci.yml.
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "streamlit>=1.38",
@@ -19,3 +20,8 @@ dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put the repo root on sys.path so the tests can `import db` / `import engine`.
+# Without this, a bare `pytest` (as CI runs) only adds tests/ to sys.path and
+# collection fails with ModuleNotFoundError — `python -m pytest` happened to
+# work locally because it also adds the current directory.
+pythonpath = ["."]
