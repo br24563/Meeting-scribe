@@ -4,6 +4,7 @@ The Markdown + audio files under STORAGE_DIR remain the portable source of
 truth. This index just makes search, tagging, and cross-category listing
 fast without re-reading every file on each interaction.
 """
+import json
 import sqlite3
 from pathlib import Path
 
@@ -24,6 +25,11 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE INDEX IF NOT EXISTS idx_notes_category ON notes(category);
 CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
+
+CREATE TABLE IF NOT EXISTS preferences (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -116,6 +122,41 @@ def search(query: str, category: str = None, tag: str = None, db_path: Path = DB
     with get_connection(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
+
+
+def all_tags(db_path: Path = DB_PATH):
+    """Distinct tags across all notes, without pulling full note rows."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT tags FROM notes WHERE tags != ''").fetchall()
+    tags = set()
+    for row in rows:
+        tags.update(t.strip() for t in row["tags"].split(",") if t.strip())
+    return sorted(tags)
+
+
+def get_pref(key: str, default: str = None, db_path: Path = DB_PATH) -> str:
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT value FROM preferences WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_pref(key: str, value: str, db_path: Path = DB_PATH) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO preferences (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def get_pref_json(key: str, default=None, db_path: Path = DB_PATH):
+    """Convenience wrapper for preferences that store a list/dict as JSON."""
+    raw = get_pref(key, db_path=db_path)
+    return json.loads(raw) if raw is not None else default
+
+
+def set_pref_json(key: str, value, db_path: Path = DB_PATH) -> None:
+    set_pref(key, json.dumps(value), db_path=db_path)
 
 
 def prune_missing(storage_dir: Path = config.STORAGE_DIR, db_path: Path = DB_PATH) -> int:

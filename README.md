@@ -4,6 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.11-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Local-first](https://img.shields.io/badge/data-100%25%20local-brightgreen)
+![Version](https://img.shields.io/badge/version-0.3.0-orange)
 
 EchoPad turns your lectures, meetings, interviews, and study sessions into clean, structured notes — automatically, and without sending a single byte to the cloud.
 
@@ -29,6 +30,9 @@ Record straight from your browser (or upload a file), and EchoPad transcribes it
 | **Multi-Format Export** | Download any note as Markdown, HTML, or PDF for sharing or printing. |
 | **Delete, With a Safety Net** | Every note has a Delete button that opens a confirmation dialog first — no accidental one-click data loss. |
 | **Explorer-Friendly Storage** | Every note gets its own folder (e.g. `notes/Lectures/organic_chemistry_midterm_review/`) holding its `note.md` and `recording.wav` together — browse, back up, or move your notes directly in File Explorer/Finder, no app required. |
+| **Fully Customizable** | Add your own categories, write your own prompt templates, and register any Ollama model you've pulled locally — all from an in-app Settings tab, no code edits. |
+| **Live Transcription Progress** | Long lecture recordings show a running word count as they transcribe, instead of a static spinner with no feedback. |
+| **One-Click Backup** | Zip up every note, recording, and tag from Settings — for a new laptop, a reinstall, or just peace of mind. |
 
 Everything is indexed in a local SQLite database (`notes/echopad.db`) so search, tags, and the dashboard stay fast as your note collection grows — while the Markdown and audio files themselves remain plain files on disk, so your notes are never locked into a proprietary format.
 
@@ -94,12 +98,25 @@ Open the URL Streamlit prints (typically `http://localhost:8501`) and start reco
 
 | Setting | Location | Default |
 |---|---|---|
-| Whisper model size | Sidebar dropdown, or `ECHOPAD_WHISPER_MODEL` in `.env` | `base` |
-| Ollama model | Sidebar dropdown, or `ECHOPAD_OLLAMA_MODEL` in `.env` | `llama3.2` |
+| Whisper model size | Sidebar dropdown, or ⚙️ Settings → Default Models | `base` |
+| Ollama model | Sidebar dropdown, or ⚙️ Settings → Default Models | `llama3.2` |
 | Note storage directory | `ECHOPAD_STORAGE_DIR` in `.env` | `./notes` |
-| Note categories | `config.py` → `SUBSECTIONS` | Lectures, Meetings, Interviews, Networking, Brainstorming, General |
+| Note categories | Built-in list, extendable in ⚙️ Settings → Categories | Lectures, Meetings, Interviews, Networking, Brainstorming, General |
+| Prompt templates | Built-in list, extendable in ⚙️ Settings → Prompt Templates | Lecture, Meeting, Interview, Networking, Brainstorming |
 
-Copy [`.env.example`](.env.example) to `.env` to override any of the above without touching code.
+Copy [`.env.example`](.env.example) to `.env` for machine-level defaults (storage location, etc.) that don't touch code. Everything else — categories, templates, default models, display density — lives in the in-app **⚙️ Settings** tab and is saved locally, so it persists across restarts without editing a config file.
+
+### ⚙️ Settings tab
+
+The Settings tab (next to Dashboard and New Note, when no note is open) is where the app becomes *yours* rather than a fixed tool:
+
+- **📁 Categories** — add categories beyond the built-in six (e.g. "Research," "Journaling"). Custom categories can be removed once empty; built-ins are permanent so your folder structure stays predictable.
+- **📝 Prompt Templates** — write your own note format. A template is just a prompt string with a `{transcript}` placeholder — copy one of the built-ins as a starting point and adjust the structure/tone to fit how *you* want notes formatted.
+- **🎛️ Default Models** — set which Whisper/Ollama model should be pre-selected next time you open the app, and register any Ollama model you've pulled locally that isn't in the built-in dropdown (e.g. `mistral`, `phi3`).
+- **🎨 Display** — a compact-mode toggle for tighter spacing; theme (light/dark) is switched from Streamlit's own ⋮ menu, top-right.
+- **💾 Backup & Export** — one button to zip every note, recording, and tag into a single downloadable archive.
+
+All of it is stored in the same local SQLite index as your notes (`notes/echopad.db`) — nothing phones home, nothing needs an account.
 
 ### 📂 Where your notes live
 

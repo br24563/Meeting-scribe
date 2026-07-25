@@ -22,8 +22,14 @@ def _load_whisper_model(model_size: str) -> WhisperModel:
     """Load (and cache) a Whisper model so repeated transcriptions don't reload it from disk."""
     return WhisperModel(model_size, device="cpu", compute_type="int8")
 
-def transcribe_audio(audio_bytes, model_size: str = config.DEFAULT_WHISPER_MODEL, translate: bool = False) -> str:
-    """Transcribe or translate audio locally using faster-whisper."""
+def transcribe_audio(audio_bytes, model_size: str = config.DEFAULT_WHISPER_MODEL, translate: bool = False,
+                      on_progress=None) -> str:
+    """Transcribe or translate audio locally using faster-whisper.
+
+    If given, `on_progress(transcript_so_far, segment)` is called after each
+    segment is decoded, so a caller (e.g. the UI) can show live progress
+    instead of a static spinner during long recordings.
+    """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(audio_bytes.read() if hasattr(audio_bytes, "read") else audio_bytes)
         temp_path = tmp.name
@@ -32,15 +38,24 @@ def transcribe_audio(audio_bytes, model_size: str = config.DEFAULT_WHISPER_MODEL
         model = _load_whisper_model(model_size)
         task = "translate" if translate else "transcribe"
         segments, _ = model.transcribe(temp_path, beam_size=5, task=task)
-        full_transcript = " ".join([segment.text.strip() for segment in segments])
+        parts = []
+        for segment in segments:
+            parts.append(segment.text.strip())
+            if on_progress:
+                on_progress(" ".join(parts), segment)
+        full_transcript = " ".join(parts)
     finally:
         os.remove(temp_path)
 
     return full_transcript
 
-def generate_summary(transcript: str, template_key: str = "Meeting", model_name: str = config.DEFAULT_OLLAMA_MODEL) -> str:
-    """Generate structured summary using selected template and Ollama."""
-    template = config.TEMPLATES.get(template_key, config.TEMPLATES["Meeting"])
+def generate_summary(transcript: str, template: str, model_name: str = config.DEFAULT_OLLAMA_MODEL) -> str:
+    """Generate a structured summary from `transcript` using Ollama.
+
+    `template` is the full prompt template string (must contain a
+    `{transcript}` placeholder) — callers resolve which template to use
+    (built-in or user-defined) before calling this.
+    """
     prompt = template.format(transcript=transcript)
     response = ollama.generate(model=model_name, prompt=prompt)
     return response["response"]

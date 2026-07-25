@@ -7,7 +7,10 @@ textColor = "#1F1B2E"
 font = "sans serif"
 
 [client]
-toolbarMode = "minimal"
+# "viewer" hides Streamlit's Deploy/GitHub branding but keeps the ⋮ menu
+# (including the light/dark theme toggle) reachable — "minimal" would hide
+# that too, taking away the one built-in way users can switch themes.
+toolbarMode = "viewer"
 
 [browser]
 gatherUsageStats = false

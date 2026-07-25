@@ -1,6 +1,35 @@
 import db
 
 
+def test_get_set_pref(tmp_path):
+    db_path = tmp_path / "test.db"
+    assert db.get_pref("default_ollama_model", default="llama3.2", db_path=db_path) == "llama3.2"
+
+    db.set_pref("default_ollama_model", "qwen2.5", db_path=db_path)
+    assert db.get_pref("default_ollama_model", db_path=db_path) == "qwen2.5"
+
+    # Overwriting an existing key should update, not duplicate
+    db.set_pref("default_ollama_model", "phi3", db_path=db_path)
+    assert db.get_pref("default_ollama_model", db_path=db_path) == "phi3"
+
+
+def test_get_set_pref_json(tmp_path):
+    db_path = tmp_path / "test.db"
+    assert db.get_pref_json("custom_categories", default=[], db_path=db_path) == []
+
+    db.set_pref_json("custom_categories", ["Research", "Journaling"], db_path=db_path)
+    assert db.get_pref_json("custom_categories", db_path=db_path) == ["Research", "Journaling"]
+
+
+def test_all_tags(tmp_path):
+    db_path = tmp_path / "test.db"
+    db.add_note("Note A", "Lectures", "a.md", tags="orgo, midterm", db_path=db_path)
+    db.add_note("Note B", "Lectures", "b.md", tags="midterm, chapter-4", db_path=db_path)
+    db.add_note("Note C", "Interviews", "c.md", tags="", db_path=db_path)
+
+    assert db.all_tags(db_path=db_path) == ["chapter-4", "midterm", "orgo"]
+
+
 def test_add_note_and_recent(tmp_path):
     db_path = tmp_path / "test.db"
     db.add_note("Midterm Review", "Lectures", "midterm_review.md", template="Lecture", tags="orgo, ch4", db_path=db_path)
