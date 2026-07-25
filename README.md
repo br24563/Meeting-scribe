@@ -59,7 +59,8 @@ Open the **📚 Study** tab.
 |---|---|
 | `.pdf` | Text layer extracted directly. A scanned PDF is detected and you're told to import the pages as images instead. |
 | `.docx` | Paragraphs and tables (older `.doc` isn't supported — re-save as `.docx`). |
-| `.txt` `.md` `.csv` `.rtf` | Read directly, with encoding detection. |
+| `.txt` `.md` `.csv` | Read directly, with encoding detection (UTF-8/UTF-16/cp1252). |
+| `.rtf` | Text extracted from the RTF markup, including accented and unicode escapes. |
 | `.png` `.jpg` `.jpeg` `.webp` `.tif` `.bmp` | OCR — for a photo of a whiteboard, a handout, or a page of a textbook. |
 
 The extracted text runs through the same templates as a recording, and the original file is filed inside the note's folder so the note always traces back to its source. You can also attach extra material to any existing note from **📎 Attachments** in the reader view.

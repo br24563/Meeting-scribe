@@ -193,6 +193,13 @@ def _feed_is_stale(source: dict) -> bool:
     return datetime.now(timezone.utc) - last > timedelta(hours=FEED_STALE_HOURS)
 
 
+def _clear_edit_dialog_state(deadline_id: int) -> None:
+    """Forget this deadline's form state once the dialog has done its job, so a
+    later reopen reflects what's actually stored — after a revert, especially."""
+    for field in ("title", "course", "date", "allday", "time", "kind", "desc"):
+        st.session_state.pop(f"ed_{field}_{deadline_id}", None)
+
+
 @st.dialog("Edit deadline")
 def _edit_deadline_dialog(deadline: dict):
     """Edit any deadline — including one that came from an LMS feed.
@@ -209,21 +216,26 @@ def _edit_deadline_dialog(deadline: dict):
     elif from_feed:
         st.caption("This came from a connected feed. Your edits will survive future syncs.")
 
-    title = st.text_input("Title", value=deadline["title"], key="ed_title")
-    course = st.text_input("Course", value=deadline["course"] or "", key="ed_course")
+    # Keys are scoped to this deadline. With a shared key, Streamlit would reuse
+    # the value already in session state and ignore `value=`, so opening Edit on a
+    # second deadline would show — and then save — the first one's details.
+    k = deadline["id"]
+    title = st.text_input("Title", value=deadline["title"], key=f"ed_title_{k}")
+    course = st.text_input("Course", value=deadline["course"] or "", key=f"ed_course_{k}")
 
     current = _to_local(deadline["due_at"])
     col_date, col_time = st.columns(2)
     with col_date:
-        new_date = st.date_input("Due date", value=current.date(), key="ed_date")
+        new_date = st.date_input("Due date", value=current.date(), key=f"ed_date_{k}")
     with col_time:
-        all_day = st.checkbox("All day", value=bool(deadline["all_day"]), key="ed_allday")
+        all_day = st.checkbox("All day", value=bool(deadline["all_day"]), key=f"ed_allday_{k}")
         new_time = st.time_input("Due time", value=current.time().replace(second=0),
-                                 key="ed_time", disabled=all_day)
+                                 key=f"ed_time_{k}", disabled=all_day)
 
     kind = st.selectbox("Type", ["assignment", "event"],
-                        index=0 if deadline["kind"] == "assignment" else 1, key="ed_kind")
-    notes = st.text_area("Notes", value=deadline["description"] or "", height=100, key="ed_desc")
+                        index=0 if deadline["kind"] == "assignment" else 1, key=f"ed_kind_{k}")
+    notes = st.text_area("Notes", value=deadline["description"] or "", height=100,
+                         key=f"ed_desc_{k}")
 
     st.divider()
     col_cancel, col_save = st.columns(2)
@@ -243,17 +255,20 @@ def _edit_deadline_dialog(deadline: dict):
                 all_day=all_day, kind=kind, description=notes.strip(),
             )
             st.session_state["flash"] = f'Updated "{title.strip()}".'
+            _clear_edit_dialog_state(k)
             st.rerun()
 
     if from_feed and deadline["user_edited"] and deadline["feed_title"]:
         if st.button("↩️ Reset to the LMS version", use_container_width=True):
             db.revert_deadline_to_feed(deadline["id"])
             st.session_state["flash"] = "Reset to what your LMS says."
+            _clear_edit_dialog_state(k)
             st.rerun()
 
     if st.button("🗑️ Delete this deadline", use_container_width=True):
         db.delete_deadline(deadline["id"])
         st.session_state["flash"] = f'Deleted "{deadline["title"]}".'
+        _clear_edit_dialog_state(k)
         st.rerun()
 
 
@@ -501,10 +516,10 @@ if active_file and active_file.exists():
             st.session_state["flash"] = "Note updated successfully."
             st.rerun()
 
-    # This note's action items, tickable in place
-    note_tasks = db.action_items(include_done=True)
-    note_tasks = [t for t in note_tasks
-                  if t["category"] == note_category and t["filename"] == note_filename]
+    # This note's action items, tickable in place. Narrowed by category in SQL so
+    # opening one note doesn't pull every task in the library into memory.
+    note_tasks = [t for t in db.action_items(category=note_category, include_done=True)
+                  if t["filename"] == note_filename]
     if note_tasks:
         open_count = sum(1 for t in note_tasks if not t["done"])
         with st.expander(f"✅ Action Items ({open_count} open of {len(note_tasks)})", expanded=bool(open_count)):
@@ -867,7 +882,10 @@ else:
         else:
             overdue = [d for d in upcoming if not d["completed"]
                        and _to_local(d["due_at"]) < now_local]
-            future = [d for d in upcoming if d not in overdue]
+            # Split by id: a term's worth of deadlines runs to four figures, and
+            # `d not in overdue` would compare whole dicts n² times per render.
+            overdue_ids = {d["id"] for d in overdue}
+            future = [d for d in upcoming if d["id"] not in overdue_ids]
 
             def render_deadline(item):
                 with st.container(border=True):

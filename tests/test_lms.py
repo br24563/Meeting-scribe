@@ -250,11 +250,39 @@ def test_event_without_a_date_is_skipped_with_a_warning():
     assert warnings and "skipped" in warnings[0]
 
 
-def test_event_without_a_uid_still_gets_a_stable_key():
+def test_event_without_a_uid_still_gets_a_key():
     found, _ = parse(
         "BEGIN:VEVENT", "DTSTART:20260901T120000Z", "SUMMARY:No UID here", "END:VEVENT",
     )
     assert len(found) == 1 and found[0]["uid"]
+
+
+def test_synthesized_uid_is_stable_across_processes():
+    """Regression guard: this was derived from hash(), which Python randomizes
+    per process — so a UID-less feed entry changed identity on every restart and
+    lost whatever the student had ticked off on it."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys; sys.path.insert(0, %r); import lms; "
+        "print(lms._synthetic_uid('Essay Draft', '2026-09-01T12:00:00+00:00'))"
+        % str(__import__("pathlib").Path(lms.__file__).parent)
+    )
+    values = {
+        subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                       check=True).stdout.strip()
+        for _ in range(3)
+    }
+    assert len(values) == 1, f"UID changed between processes: {values}"
+    assert values.pop() == lms._synthetic_uid("Essay Draft", "2026-09-01T12:00:00+00:00")
+
+
+def test_synthesized_uids_differ_for_different_entries():
+    a = lms._synthetic_uid("Essay Draft", "2026-09-01T12:00:00+00:00")
+    b = lms._synthetic_uid("Essay Draft", "2026-09-02T12:00:00+00:00")
+    c = lms._synthetic_uid("Lab Report", "2026-09-01T12:00:00+00:00")
+    assert len({a, b, c}) == 3
 
 
 def test_missing_summary_becomes_a_placeholder():

@@ -11,14 +11,17 @@ rather than breaking the app or the other formats.
 """
 import codecs
 import io
+import re
 from pathlib import Path
 
-TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".rtf"}
+TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv"}
+RTF_SUFFIXES = {".rtf"}
 PDF_SUFFIXES = {".pdf"}
 DOCX_SUFFIXES = {".docx"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 
-SUPPORTED_SUFFIXES = TEXT_SUFFIXES | PDF_SUFFIXES | DOCX_SUFFIXES | IMAGE_SUFFIXES
+SUPPORTED_SUFFIXES = (TEXT_SUFFIXES | RTF_SUFFIXES | PDF_SUFFIXES | DOCX_SUFFIXES
+                      | IMAGE_SUFFIXES)
 
 # For st.file_uploader, which wants extensions without the dot.
 UPLOAD_TYPES = sorted(suffix.lstrip(".") for suffix in SUPPORTED_SUFFIXES)
@@ -52,6 +55,49 @@ def _decode_text(data: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="replace")
+
+
+_RTF_IGNORABLE = re.compile(r"\{\\\*(?:[^{}]|\{[^{}]*\})*\}")
+_RTF_UNICODE = re.compile(r"\\u(-?\d+)\s?\??")
+_RTF_HEX = re.compile(r"\\'([0-9a-fA-F]{2})")
+_RTF_CONTROL = re.compile(r"\\([a-zA-Z]+)(-?\d+)? ?")
+_RTF_TABLES = ("fonttbl", "colortbl", "stylesheet", "listtable", "listoverridetable",
+               "info", "pntext", "generator", "themedata", "datastore")
+
+
+def _extract_rtf(data: bytes):
+    """Pull the readable text out of an RTF file.
+
+    Without this, an `.rtf` import would hand the model a page of `\\rtf1\\ansi`
+    control words as if they were the student's notes.
+    """
+    text = _decode_text(data)
+    if not text.lstrip().startswith("{\\rtf"):
+        return text.strip(), []  # mislabelled: it's really plain text
+
+    for table in _RTF_TABLES:            # font/colour/style tables carry no prose
+        text = re.sub(r"\{\\" + table + r"(?:[^{}]|\{[^{}]*\})*\}", "", text)
+    text = _RTF_IGNORABLE.sub("", text)  # \* destinations are skippable by spec
+
+    text = re.sub(r"\\(?:par|line|sect|page)\b ?", "\n", text)
+    text = re.sub(r"\\tab\b ?", "\t", text)
+
+    text = _RTF_UNICODE.sub(
+        lambda m: chr(int(m.group(1)) % 65536) if m.group(1) else "", text)
+    text = _RTF_HEX.sub(
+        lambda m: bytes([int(m.group(1), 16)]).decode("cp1252", "replace"), text)
+
+    # Shield the escaped literals before stripping the remaining control words
+    text = (text.replace("\\\\", "\x00").replace("\\{", "\x01").replace("\\}", "\x02"))
+    text = _RTF_CONTROL.sub("", text)
+    text = text.replace("{", "").replace("}", "")
+    text = (text.replace("\x00", "\\").replace("\x01", "{").replace("\x02", "}"))
+
+    lines = [line.strip() for line in text.split("\n")]
+    cleaned = "\n".join(line for line in lines if line)
+    if not cleaned.strip():
+        return "", ["No readable text could be extracted from that RTF file."]
+    return cleaned.strip(), []
 
 
 def _extract_pdf(data: bytes):
@@ -169,6 +215,8 @@ def extract_text(filename: str, data: bytes):
 
     if suffix in TEXT_SUFFIXES:
         return _decode_text(data).strip(), []
+    if suffix in RTF_SUFFIXES:
+        return _extract_rtf(data)
     if suffix in PDF_SUFFIXES:
         return _extract_pdf(data)
     if suffix in DOCX_SUFFIXES:

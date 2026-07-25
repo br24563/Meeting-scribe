@@ -10,6 +10,7 @@ The feed URL is a bearer credential: anyone holding it can read your calendar,
 so it's stored locally alongside your notes and never sent anywhere but your
 school's own server.
 """
+import hashlib
 import re
 import socket
 import ssl
@@ -17,8 +18,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, time, timedelta, timezone
-
-from icalendar import Calendar
 
 USER_AGENT = "EchoPad/0.5 (+https://github.com/br24563/Echo-pad)"
 FETCH_TIMEOUT_SECONDS = 20
@@ -94,6 +93,23 @@ GRADESCOPE_NOTE = (
 
 class FeedError(Exception):
     """A feed couldn't be fetched or read, with a message meant for the user."""
+
+
+def _calendar_parser():
+    """Import icalendar on demand.
+
+    app.py imports this module unconditionally, so a module-level import would
+    make one missing optional dependency take down note-taking entirely rather
+    than just disabling calendar sync.
+    """
+    try:
+        from icalendar import Calendar
+    except ImportError:
+        raise FeedError(
+            "Reading calendar feeds needs the `icalendar` package. Install it with "
+            "`pip install icalendar` (or use the Docker launcher, which includes it)."
+        )
+    return Calendar
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +235,18 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _synthetic_uid(summary: str, when_iso: str) -> str:
+    """A stable key for a feed entry that has no UID of its own.
+
+    Deliberately a digest rather than hash(): Python randomizes string hashing
+    per process, so a hash-derived key would change on every restart. The row
+    would then look like a different entry each launch — losing whatever the
+    student had ticked off on it.
+    """
+    digest = hashlib.sha1(f"{summary}|{when_iso}".encode("utf-8")).hexdigest()[:16]
+    return f"echopad-{digest}"
+
+
 _COURSE_PATTERNS = (
     re.compile(r"\[([^\[\]]{2,40})\]\s*$"),   # Canvas: "Problem Set 4 [BIO 201]"
     re.compile(r"\(([^()]{2,40})\)\s*$"),      # "Essay Draft (ENG 105)"
@@ -285,7 +313,10 @@ def _rrule_occurrences(start: datetime, rrule, window_start: datetime, window_en
         count = int(first("COUNT")) if first("COUNT") is not None else None
     except (TypeError, ValueError):
         count = None
-    until = _as_utc(first("UNTIL"))
+    # A date-only UNTIL bounds the whole day, so read it as end-of-day rather
+    # than midnight — otherwise a legitimate final occurrence gets dropped.
+    until_raw = first("UNTIL")
+    until = _as_utc(until_raw, all_day_end_of_day=not isinstance(until_raw, datetime))
     bydays = [_WEEKDAYS[str(d).upper()[-2:]] for d in (rrule.get("BYDAY") or [])
               if str(d).upper()[-2:] in _WEEKDAYS]
 
@@ -359,8 +390,9 @@ def parse_ics(data, window_start: datetime = None, window_end: datetime = None):
     if isinstance(data, str):
         data = data.encode("utf-8", "replace")
 
+    calendar_class = _calendar_parser()
     try:
-        calendar = Calendar.from_ical(data)
+        calendar = calendar_class.from_ical(data)
     except Exception as exc:
         raise FeedError(f"That calendar couldn't be read ({exc}).")
 
@@ -400,7 +432,7 @@ def parse_ics(data, window_start: datetime = None, window_end: datetime = None):
             for index, moment in enumerate(moments):
                 # A recurring event needs a distinct key per occurrence, or each
                 # one would overwrite the last in the index.
-                base_uid = uid or f"echopad-{abs(hash((summary, _iso(when))))}"
+                base_uid = uid or _synthetic_uid(summary, _iso(when))
                 occurrence_uid = base_uid if len(moments) == 1 and not rrule else f"{base_uid}#{_iso(moment)}"
                 deadlines.append({
                     "uid": occurrence_uid,

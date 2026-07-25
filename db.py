@@ -14,6 +14,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -106,6 +107,10 @@ CREATE TABLE IF NOT EXISTS action_items (
 );
 CREATE INDEX IF NOT EXISTS idx_action_items_done ON action_items(done);
 """
+
+# Bind-variable batch size for generated IN(…) clauses. Comfortably under the
+# 999-variable cap of SQLite builds older than 3.32.
+_SQL_CHUNK = 500
 
 # Spaced repetition, SM-2 without the parts that need a full review history.
 MIN_EASE, MAX_EASE = 1.3, 3.0
@@ -660,18 +665,28 @@ def prune_deadlines_missing_from_feed(source_id: int, seen_uids, db_path=None) -
     Skipped entirely when the feed returned nothing, so a partial fetch can't
     wipe a term's deadlines, and rows the student has edited are always kept:
     their own work outranks the feed's idea of what exists.
+
+    The difference is computed in Python rather than with a `uid NOT IN (…)`
+    list: a year of a busy calendar (recurring lectures especially) runs to
+    thousands of entries, and SQLite builds older than 3.32 cap a statement at
+    999 variables — which would have made syncing fail outright for exactly the
+    students with the most to keep track of.
     """
-    seen = list(seen_uids)
+    seen = set(seen_uids)
     if not seen:
         return 0
+
     with _connect(db_path) as conn:
-        placeholders = ",".join("?" * len(seen))
-        cursor = conn.execute(
-            f"""DELETE FROM deadlines
-                WHERE source_id IS ? AND user_edited = 0 AND uid NOT IN ({placeholders})""",
-            [source_id, *seen],
-        )
-    return cursor.rowcount or 0
+        rows = conn.execute(
+            "SELECT id, uid FROM deadlines WHERE source_id IS ? AND user_edited = 0",
+            (source_id,),
+        ).fetchall()
+        stale = [row["id"] for row in rows if row["uid"] not in seen]
+        for start in range(0, len(stale), _SQL_CHUNK):
+            chunk = stale[start:start + _SQL_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            conn.execute(f"DELETE FROM deadlines WHERE id IN ({placeholders})", chunk)
+    return len(stale)
 
 
 def add_manual_deadline(title: str, due_at: str, course: str = "", all_day: bool = False,
@@ -679,7 +694,7 @@ def add_manual_deadline(title: str, due_at: str, course: str = "", all_day: bool
                         db_path=None) -> int:
     """Add a deadline by hand — for a Gradescope-only assignment, or anything
     that isn't in a feed. Stored with no source so syncing never disturbs it."""
-    uid = f"manual-{abs(hash((title, due_at, course)))}-{_utc_now_iso()}"
+    uid = f"manual-{uuid.uuid4().hex[:16]}"
     with _connect(db_path) as conn:
         cursor = conn.execute(
             """INSERT INTO deadlines

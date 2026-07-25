@@ -32,6 +32,72 @@ def test_strips_a_utf8_byte_order_mark():
     assert text == "Heading"
 
 
+# --------------------------------- RTF --------------------------------
+
+def test_rtf_yields_prose_not_control_words():
+    """Regression guard: `.rtf` was read as plain text, so an import handed the
+    model a page of \\rtf1\\ansi markup as if it were the student's notes."""
+    rtf = (rb"{\rtf1\ansi\deff0{\fonttbl{\f0 Times;}}"
+           rb"\f0\fs24 Lecture 3: \b Osmosis\b0 \par Water moves across a membrane.\par}")
+    text, warnings = importers.extract_text("notes.rtf", rtf)
+
+    assert text == "Lecture 3: Osmosis\nWater moves across a membrane."
+    assert "\\rtf" not in text and "fonttbl" not in text
+    assert warnings == []
+
+
+def test_rtf_decodes_hex_and_unicode_escapes():
+    # \'e9 is a cp1252 byte escape; 舒? is RTF's signed-decimal unicode escape.
+    rtf = (rb"{\rtf1\ansi\ansicpg1252{\fonttbl{\f0 Times;}}{\colortbl;\red0\green0\blue0;}"
+           rb"{\*\generator Riched20 10.0;}\pard\f0 Caf\'e9 study \u8212? notes\par}")
+    text, _ = importers.extract_text("notes.rtf", rtf)
+
+    assert text == "Café study — notes"   # -> "Caf(e-acute) study (em dash) notes"
+
+
+def test_rtf_strips_tables_and_ignorable_destinations():
+    rtf = (rb"{\rtf1\ansi{\fonttbl{\f0\froman Times New Roman;}}"
+           rb"{\colortbl;\red255\green0\blue0;}{\stylesheet{\s0 Normal;}}"
+           rb"{\*\generator Riched20;}{\info{\author Someone}}"
+           rb"\pard Real content here\par}")
+    text, _ = importers.extract_text("notes.rtf", rtf)
+
+    assert text == "Real content here"
+    for leaked in ("Times New Roman", "Normal", "Riched20", "Someone"):
+        assert leaked not in text
+
+
+def test_rtf_keeps_escaped_literal_braces_and_backslashes():
+    rtf = rb"{\rtf1\ansi Set \{a, b\} at 50\\50\par}"
+    text, _ = importers.extract_text("notes.rtf", rtf)
+    assert text == r"Set {a, b} at 50\50"
+
+
+def test_rtf_handles_nested_formatting_groups():
+    rtf = rb"{\rtf1\ansi {\b{\i Bold italic}} then plain\par}"
+    text, _ = importers.extract_text("notes.rtf", rtf)
+    assert text == "Bold italic then plain"
+
+
+def test_rtf_converts_tabs_and_collapses_blank_lines():
+    rtf = rb"{\rtf1\ansi One\tab Two\par\par\par Three\par}"
+    text, _ = importers.extract_text("notes.rtf", rtf)
+    assert text == "One\tTwo\nThree"
+
+
+def test_a_mislabelled_rtf_falls_back_to_plain_text():
+    text, warnings = importers.extract_text("notes.rtf", b"Actually just plain text")
+    assert text == "Actually just plain text"
+    assert warnings == []
+
+
+def test_rtf_with_no_prose_reports_a_warning():
+    text, warnings = importers.extract_text(
+        "empty.rtf", rb"{\rtf1\ansi{\fonttbl{\f0 Times;}}}")
+    assert text == ""
+    assert warnings and "readable text" in warnings[0]
+
+
 # --------------------------------- PDF --------------------------------
 
 def test_reads_text_from_a_pdf(tmp_path):

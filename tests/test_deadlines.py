@@ -102,6 +102,49 @@ def test_prune_does_nothing_when_the_feed_came_back_empty(tmp_path):
     assert len(db.deadlines(db_path=db_path)) == 2
 
 
+def test_prune_handles_a_feed_far_larger_than_sqlites_variable_limit(tmp_path):
+    """Regression guard: this used to build one `uid NOT IN (?,?,…)` per entry.
+    A year of a busy calendar runs to thousands of entries, and SQLite builds
+    before 3.32 cap a statement at 999 variables — so syncing failed outright
+    for exactly the students with the most to track."""
+    db_path = tmp_path / "d.db"
+    source = _source(tmp_path, db_path)
+    many = [feed_item(f"uid-{n}", title=f"Item {n}") for n in range(2500)]
+    db.upsert_deadlines(source, many, db_path=db_path)
+    assert len(db.deadlines(db_path=db_path)) == 2500
+
+    # Everything still present in the feed except one entry
+    keep = [item["uid"] for item in many[:-1]]
+    removed = db.prune_deadlines_missing_from_feed(source, keep, db_path=db_path)
+
+    assert removed == 1
+    assert len(db.deadlines(db_path=db_path)) == 2499
+
+
+def test_prune_removes_many_stale_entries_in_one_go(tmp_path):
+    """The delete side is chunked too — dropping a term's worth at once."""
+    db_path = tmp_path / "d.db"
+    source = _source(tmp_path, db_path)
+    db.upsert_deadlines(source, [feed_item(f"uid-{n}") for n in range(1800)], db_path=db_path)
+
+    removed = db.prune_deadlines_missing_from_feed(source, ["uid-0"], db_path=db_path)
+
+    assert removed == 1799
+    assert [d["uid"] for d in db.deadlines(db_path=db_path)] == ["uid-0"]
+
+
+def test_manual_deadline_uids_are_unique_even_when_identical(tmp_path):
+    """Two manual deadlines with the same title, date and course are legitimate
+    and must not collide into one row."""
+    db_path = tmp_path / "d.db"
+    for _ in range(3):
+        db.add_manual_deadline("Office hours", "2026-09-01T12:00:00+00:00",
+                               course="BIO 201", db_path=db_path)
+    rows = db.deadlines(db_path=db_path)
+    assert len(rows) == 3
+    assert len({r["uid"] for r in rows}) == 3
+
+
 def test_manual_deadlines_are_untouched_by_syncing(tmp_path):
     db_path = tmp_path / "d.db"
     source = _source(tmp_path, db_path)
